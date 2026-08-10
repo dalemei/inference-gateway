@@ -1,0 +1,61 @@
+# Go 推理网关 — 示例配置文件
+# 
+# 网关作用：在客户端和 vLLM 推理后端之间做一层代理，提供：
+#   - 多后端轮询负载均衡（round-robin）
+#   - 失败自动重试（跳过已失败后端）
+#   - SSE 流式代理（stream=true 时透传）
+#   - 自动健康检查（/health 端点探测）
+#   - Prometheus 指标暴露（/metrics）
+#   - 后端状态查看（/backends）
+#   - 超时控制 + 结构化日志（含 X-Request-ID）
+
+gateway:
+  port: 8080          # 网关监听端口
+  timeout: "120s"     # 后端请求超时（vLLM 推理可能较慢，设大一些）
+  max_retries: 1      # 失败重试次数（0=不重试，1=重试1次，建议 1-2）
+
+backends:
+  # ========== AutoDL vLLM 后端 ==========
+  # 启动 vLLM 后，需要在 AutoDL 控制台获取 SSH 隧道或公网 IP。
+  # 方式一（推荐）：SSH 端口转发
+  #   本机执行: ssh -L 8000:localhost:8000 -p <SSH端口> root@<AutoDL_IP>
+  #   url 填: http://localhost:8000
+  #
+  # 方式二：AutoDL 自定义服务（暴露公网端口）
+  #   在 AutoDL 控制台 → 实例 → 自定义服务 → 添加 8000 端口
+  #   url 填: http://<AutoDL_公网IP>:<暴露端口>
+  #
+  - name: "auto-vllm-4080"
+    url: "http://localhost:8000"     # ← 修改为实际地址
+    health_check_interval: "10s"
+
+  # 多后端示例（去掉注释即可启用）:
+  # - name: "vllm-node-2"
+  #   url: "http://192.168.1.101:8000"
+  #   health_check_interval: "10s"
+  #
+  # - name: "vllm-node-3"
+  #   url: "http://192.168.1.102:8000"
+  #   health_check_interval: "10s"
+
+# ========== 启动方式 ==========
+# 
+# 1. 在本机（Windows）启动网关:
+#    cd inference-gateway
+#    go run . --config config.yaml
+#
+# 2. 普通请求测试:
+#    curl http://localhost:8080/v1/chat/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{"model":"/root/autodl-tmp/models/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
+#
+# 3. 流式请求测试:
+#    curl http://localhost:8080/v1/chat/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{"model":"/root/autodl-tmp/models/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+#
+# 4. 查看指标:
+#    curl http://localhost:8080/metrics
+#
+# 5. 查看后端状态:
+#    curl http://localhost:8080/backends | python -m json.tool

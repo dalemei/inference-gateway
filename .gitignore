@@ -1,0 +1,34 @@
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+inference-gateway
+
+# 测试二进制
+*.test
+
+# 输出目录
+/output/
+/bin/
+/dist/
+
+# Go 工作区
+go.work
+go.work.sum
+
+# 本地配置文件（包含真实后端地址，不要提交）
+config.local.yaml
+config.prod.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

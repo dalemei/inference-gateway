@@ -140,6 +140,15 @@ func writeMetrics(w io.Writer, pool *BackendPool) {
 	}
 
 	// 健康检查延迟
+	// 请求级延迟（最近一次成功代理的耗时，秒）
+	sb.WriteString("\n# HELP inference_gateway_backend_request_latency_seconds 后端最近一次请求延迟（秒）\n")
+	sb.WriteString("# TYPE inference_gateway_backend_request_latency_seconds gauge\n")
+	for backend, lat := range requestLatency {
+		sb.WriteString(fmt.Sprintf(
+			`inference_gateway_backend_request_latency_seconds{backend="%s"} %.6f`+"\n",
+			backend, lat))
+	}
+
 	sb.WriteString("\n# HELP inference_gateway_backend_latency_seconds 健康检查延迟（秒）\n")
 	sb.WriteString("# TYPE inference_gateway_backend_latency_seconds gauge\n")
 	for _, b := range backends {

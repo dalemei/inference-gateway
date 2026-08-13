@@ -161,6 +161,10 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 			log.Printf("[请求 #%d] %s → %s 失败 (attempt %d/%d): %v",
 				reqID, r.URL.Path, backend.Name, attempt+1, p.maxRetries+1, err)
 			recordGatewayError("backend_unreachable")
+			// 仅当还有剩余重试次数时才计入重试次数（最后一次失败不再重试）
+			if attempt < p.maxRetries {
+				recordRetry()
+			}
 			continue // 重试
 		}
 		defer resp.Body.Close()

@@ -40,6 +40,37 @@
 - **提交后**：`git push` 到远程以保持 streak（先 `git remote -v` 确认远程已配）。
 - **一日一 commit**：即使一天能做完多项，也拆成独立 commit，保持节奏清晰。
 
+## 协作分层：学什么 / 委托什么
+
+> 原则：**"为什么这么设计"由人定，"怎么写"交给 AI。** 目标是把人训练成架构师，而非提示词工程师。
+
+### 你该掌握的（设计层 / 必须懂）
+- 整体架构：网关在客户端与 vLLM 之间的位置、为什么需要这一层
+- 负载均衡为什么用 round-robin + `atomic.Bool` 健康位（热路径无锁读）
+- `NextExcluding` 重试排除集：绝不重试到刚失败的节点
+- **SSE 为什么不能重试、流式 client 为什么必须 `Timeout:0`**（语义正确性优先）
+- 入口 `ensureUTF8`（GBK→UTF8）：替 Windows 客户端背锅的透明修正
+- 监控指标怎么设计才有用（对照本仓库已踩的埋点废点）
+- 演进判断：什么时候该加限流 / 熔断 / 加权（架构取舍）
+
+### 可以委托 AI 的（实现层）
+- 具体 HTTP 转发代码、backend.go 的 boilerplate
+- `ensureUTF8` 里 `transform` 标准库调用等细节
+- metrics.go 的 Prometheus 文本拼接格式
+- 测试的具体断言写法、Makefile / ldflags 注入等机械活
+
+### 对人的硬要求（不可委托）
+- **博客亲自写**：用 AI 走读当底稿，但用自己的话重构、补一手踩坑体感（影响力靠真实体感）
+- **每个 PR 花 5 分钟看 diff**：尤其 Day 5 之后的测试、Day 8 的 data race 修复——review 是架构师护城河
+- **设计权衡自己拍板**：模棱两可处 AI 会自选，出事背锅的是人
+
+### 网关最该吃透的 5 个"为什么"（懂了即"拥有"代码）
+1. `atomic.Bool` 健康位 → 热路径无锁读
+2. `NextExcluding` 重试排除集 → 绝不重试到刚挂的节点
+3. SSE 不重试 + 流式 client `Timeout:0` → 语义正确性优先
+4. 显式 `Content-Length` + 剥 `Host` → 躲 chunked 解析坑
+5. 入口 `ensureUTF8` → 替 Windows GBK 客户端背锅
+
 ## 已完成 commit 记录
 - `9f7bdfa` fix: 重试计数器未累加，补充 recordRetry() 调用  (Day 1)
 - `f2cad48` fix: 暴露请求级延迟指标                  (Day 2)

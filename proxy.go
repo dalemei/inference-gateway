@@ -24,15 +24,17 @@ type Proxy struct {
 	pool       *BackendPool
 	timeout    time.Duration
 	maxRetries int
+	debug      bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
 	client     *http.Client // 共享 HTTP 客户端（连接池复用）
 }
 
 // NewProxy 创建代理实例
-func NewProxy(pool *BackendPool, timeout time.Duration, maxRetries int) *Proxy {
+func NewProxy(pool *BackendPool, timeout time.Duration, maxRetries int, debug bool) *Proxy {
 	return &Proxy{
 		pool:       pool,
 		timeout:    timeout,
 		maxRetries: maxRetries,
+		debug:      debug,
 		client: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
@@ -225,11 +227,16 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 	// 显式设置 Content-Length，避免 chunked 编码导致 vLLM 解析失败
 	proxyReq.ContentLength = int64(len(body))
 
-	// ====== 调试：dump 代理请求 ======
-	log.Printf("[SSE #%d] 代理请求 URL: %s", reqID, targetURL)
-	log.Printf("[SSE #%d] 代理请求 Headers: %v", reqID, proxyReq.Header)
-	log.Printf("[SSE #%d] 代理请求 ContentLength: %d", reqID, proxyReq.ContentLength)
-	log.Printf("[SSE #%d] 代理请求 Body HEX: %x", reqID, body)
+	// 调试日志：默认关闭。开启（-debug）时打印完整请求头与 body，
+	// 会暴露 Authorization 等敏感头及 prompt 原文，仅限排障环境使用。
+	if p.debug {
+		log.Printf("[SSE #%d] 代理请求 URL: %s", reqID, targetURL)
+		log.Printf("[SSE #%d] 代理请求 Headers: %v", reqID, proxyReq.Header)
+		log.Printf("[SSE #%d] 代理请求 ContentLength: %d", reqID, proxyReq.ContentLength)
+		log.Printf("[SSE #%d] 代理请求 Body HEX: %x", reqID, body)
+	} else {
+		log.Printf("[SSE #%d] → %s (backend %s)", reqID, targetURL, backend.Name)
+	}
 
 	// 流式请求不能用带超时的 client（SSE 可能持续数分钟）
 	streamClient := &http.Client{

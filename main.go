@@ -13,6 +13,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
+	debug := flag.Bool("debug", false, "启用调试日志（打印请求头与 body，含敏感信息）")
 	flag.Parse()
 
 	// 加载配置
@@ -52,7 +53,7 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	// 创建代理
-	proxy := NewProxy(pool, timeout, cfg.Gateway.MaxRetries)
+	proxy := NewProxy(pool, timeout, cfg.Gateway.MaxRetries, *debug)
 
 	// ====== 路由注册 ======
 	mux := http.NewServeMux()
@@ -100,6 +101,7 @@ func main() {
 	}
 	log.Printf("超时设置: %v", timeout)
 	log.Printf("最大重试: %d", cfg.Gateway.MaxRetries)
+	log.Printf("调试日志: %v", *debug)
 	log.Println("=======================================")
 
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {

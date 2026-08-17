@@ -2,7 +2,7 @@
 
 > 目标：持续向本仓库灌入**有价值的 commit**，保持 GitHub 日更 streak。
 > 原则：每天 1 个干净 commit，改动小、可编译、可测试。每完成一天在下方表格勾掉。
-> 当前进度：**Day 1–2 已完成**（见文末 commit 记录）。
+> 当前进度：**Day 1–3 已完成**（见文末 commit 记录）。
 
 ## 进度图例
 - ✅ 已完成
@@ -15,7 +15,7 @@
 |-----|------|-------------------|--------|------|------|
 | 1 | ✅ | fix: 重试计数器未累加 | 重试循环补 `recordRetry()` | proxy.go | ⭐ |
 | 2 | ✅ | fix: 暴露请求级延迟指标 | 新增 `backend_request_latency_seconds` | metrics.go | ⭐ |
-| 3 | ⬜ | refactor: 移除 SSE body HEX dump | 删/加开关控制调试日志（性能+隐私） | proxy.go L224-228 | ⭐ |
+| 3 | ✅ | refactor: 移除 SSE body HEX dump | 删/加开关控制调试日志（性能+隐私） | proxy.go L224-232 | ⭐ |
 | 4 | ⬜ | fix: 优雅关闭改用 Shutdown(ctx) | 流式连接不再被瞬间切断 | main.go L79-86 | ⭐⭐ |
 | 5 | ⬜ | test: detectStreaming / ensureUTF8 单测 | 新建 `proxy_test.go` | 新测试文件 | ⭐⭐ |
 | 6 | ⬜ | test: BackendPool round-robin 单测 | 全不健康→nil、排除集合逻辑 | 新测试文件 | ⭐⭐ |
@@ -74,3 +74,4 @@
 ## 已完成 commit 记录
 - `9f7bdfa` fix: 重试计数器未累加，补充 recordRetry() 调用  (Day 1)
 - `f2cad48` fix: 暴露请求级延迟指标                  (Day 2)
+- `2168897` refactor: 移除 SSE body HEX dump，调试日志加 -debug 开关 (Day 3)

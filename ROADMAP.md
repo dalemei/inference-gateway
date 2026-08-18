@@ -16,7 +16,7 @@
 | 1 | ✅ | fix: 重试计数器未累加 | 重试循环补 `recordRetry()` | proxy.go | ⭐ |
 | 2 | ✅ | fix: 暴露请求级延迟指标 | 新增 `backend_request_latency_seconds` | metrics.go | ⭐ |
 | 3 | ✅ | refactor: 移除 SSE body HEX dump | 删/加开关控制调试日志（性能+隐私） | proxy.go L224-232 | ⭐ |
-| 4 | ⬜ | fix: 优雅关闭改用 Shutdown(ctx) | 流式连接不再被瞬间切断 | main.go L79-86 | ⭐⭐ |
+| 4 | ✅ | fix: 优雅关闭改用 Shutdown(ctx) | 流式连接不再被瞬间切断 | main.go L79-86 | ⭐⭐ |
 | 5 | ⬜ | test: detectStreaming / ensureUTF8 单测 | 新建 `proxy_test.go` | 新测试文件 | ⭐⭐ |
 | 6 | ⬜ | test: BackendPool round-robin 单测 | 全不健康→nil、排除集合逻辑 | 新测试文件 | ⭐⭐ |
 | 7 | ⬜ | feat: 新增 inflight 请求数 gauge | ServeHTTP 起止各 ±1（atomic） | proxy.go / metrics.go | ⭐ |

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -76,14 +77,23 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// 优雅关闭
+	// 优雅关闭：先停健康检查，再给在途请求（含流式连接）宽限期，而非瞬间切断
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
-		log.Printf("收到信号 %v，正在关闭...", sig)
+		log.Printf("收到信号 %v，正在优雅关闭...", sig)
+
+		// 先停健康检查，避免关闭期间继续探测后端
 		pool.StopAll()
-		srv.Close()
+
+		// 给在途请求一个宽限期（30s），让非流式请求正常返回、流式连接不再被瞬间切断
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("[WARN] 优雅关闭超时（在途连接未在规定时间内结束），强制退出: %v", err)
+		}
+		log.Println("网关已停止接收新连接，等待在途请求完成")
 	}()
 
 	// 打印启动信息

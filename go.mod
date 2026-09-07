@@ -1,4 +1,4 @@
-module ai-infra-lab/inference-gateway
+module github.com/dalemei/inference-gateway
 
 go 1.25.0
 

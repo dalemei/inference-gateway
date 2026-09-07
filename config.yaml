@@ -8,6 +8,7 @@
 #   - Prometheus 指标暴露（/metrics）
 #   - 后端状态查看（/backends）
 #   - 超时控制 + 结构化日志（含 X-Request-ID）
+#   - 按 model 路由（不同模型分发到不同后端池）
 
 gateway:
   port: 8080          # 网关监听端口
@@ -25,18 +26,28 @@ backends:
   #   在 AutoDL 控制台 → 实例 → 自定义服务 → 添加 8000 端口
   #   url 填: http://<AutoDL_公网IP>:<暴露端口>
   #
+  # pool 字段指定该后端归属的后端池，按 model 路由时生效
   - name: "auto-vllm-4080"
     url: "http://localhost:8000"     # ← 修改为实际地址
     health_check_interval: "10s"
+    pool: "default"                  # 归属默认池
 
-  # 多后端示例（去掉注释即可启用）:
-  # - name: "vllm-node-2"
-  #   url: "http://192.168.1.101:8000"
-  #   health_check_interval: "10s"
-  #
-  # - name: "vllm-node-3"
-  #   url: "http://192.168.1.102:8000"
-  #   health_check_interval: "10s"
+  # 第二个后端池示例：本地 Ollama（去掉注释即可启用）
+  # - name: "ollama-local"
+  #   url: "http://localhost:11434"
+  #   health_check_interval: "15s"
+  #   pool: "local"
+
+# ========== 按 model 路由 ==========
+# 未显式声明的 model 会自动落入 default_pool。
+default_pool: "default"
+
+# model 名 → 后端池 的映射（精确匹配）
+models:
+  - name: "/root/autodl-tmp/models/Qwen2.5-7B-Instruct"
+    pool: "default"
+  # - name: "llama3-8b"
+  #   pool: "local"
 
 # ========== 启动方式 ==========
 # 

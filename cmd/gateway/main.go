@@ -14,6 +14,7 @@ import (
 	"github.com/dalemei/inference-gateway/internal/backend"
 	"github.com/dalemei/inference-gateway/internal/config"
 	"github.com/dalemei/inference-gateway/internal/proxy"
+	"github.com/dalemei/inference-gateway/internal/router"
 )
 
 func main() {
@@ -38,19 +39,43 @@ func main() {
 		timeout = 60 * time.Second
 	}
 
-	// 创建后端池
-	pool := backend.NewBackendPool()
+	// 解析默认池名（未显式配置时回退为 "default"）
+	defaultPool := cfg.DefaultPool
+	if defaultPool == "" {
+		defaultPool = "default"
+	}
+
+	// 创建模型路由器（按 model 路由到不同后端池）
+	r := router.NewModelRouter(defaultPool)
+	// 确保默认池存在
+	r.RegisterPool(defaultPool)
+
 	for _, bc := range cfg.Backends {
+		poolName := bc.Pool
+		if poolName == "" {
+			poolName = defaultPool
+		}
+		pl := r.RegisterPool(poolName)
+
 		interval, err := time.ParseDuration(bc.HealthCheckInterval)
 		if err != nil || interval == 0 {
 			interval = 10 * time.Second
 		}
 
 		be := backend.NewBackend(bc.Name, bc.URL, interval, timeout)
-		pool.Add(be)
+		pl.Add(be)
 		be.StartHealthCheck()
 
-		log.Printf("[后端] %s (%s) — 健康检查间隔: %v", bc.Name, bc.URL, interval)
+		log.Printf("[后端] %s (%s) — 池: %s, 健康检查间隔: %v", bc.Name, bc.URL, poolName, interval)
+	}
+
+	// 映射模型到后端池（未匹配的 model 自动落入默认池）
+	for _, m := range cfg.Models {
+		r.RegisterPool(m.Pool) // 确保模型引用的池存在
+		if err := r.MapModel(m.Name, m.Pool); err != nil {
+			log.Fatalf("模型映射失败: %v", err)
+		}
+		log.Printf("[模型] %s → 池: %s", m.Name, m.Pool)
 	}
 
 	// 等待初始健康检查完成
@@ -58,7 +83,7 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	// 创建代理
-	gw := proxy.NewProxy(pool, timeout, cfg.Gateway.MaxRetries, *debug)
+	gw := proxy.NewProxy(r, timeout, cfg.Gateway.MaxRetries, *debug)
 
 	// ====== 路由注册 ======
 	mux := http.NewServeMux()
@@ -89,7 +114,7 @@ func main() {
 		log.Printf("收到信号 %v，正在优雅关闭...", sig)
 
 		// 先停健康检查，避免关闭期间继续探测后端
-		pool.StopAll()
+		r.StopAll()
 
 		// 给在途请求一个宽限期（30s），让非流式请求正常返回、流式连接不再被瞬间切断
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -101,12 +126,12 @@ func main() {
 	}()
 
 	// 打印启动信息
-	healthyCount := pool.HealthyCount()
+	healthyCount := r.HealthyCount()
 	log.Println("=======================================")
 	log.Printf("Go 推理网关 v1.0 已启动")
 	log.Printf("监听地址: %s", addr)
-	log.Printf("后端数量: %d (健康: %d)", len(pool.Backends()), healthyCount)
-	for _, b := range pool.Backends() {
+	log.Printf("后端数量: %d (健康: %d)", r.TotalCount(), healthyCount)
+	for _, b := range r.AllBackends() {
 		status := "健康"
 		if !b.IsHealthy() {
 			status = "不健康"

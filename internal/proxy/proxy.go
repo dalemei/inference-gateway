@@ -17,6 +17,7 @@ import (
 
 	"github.com/dalemei/inference-gateway/internal/backend"
 	"github.com/dalemei/inference-gateway/internal/metrics"
+	"github.com/dalemei/inference-gateway/internal/router"
 )
 
 // requestIDCounter 自增请求 ID 计数器
@@ -24,7 +25,7 @@ var requestIDCounter atomic.Uint64
 
 // Proxy 推理请求代理，负责接收客户端请求并转发到健康后端
 type Proxy struct {
-	pool       *backend.BackendPool
+	router     *router.ModelRouter
 	timeout    time.Duration
 	maxRetries int
 	debug      bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
@@ -32,9 +33,9 @@ type Proxy struct {
 }
 
 // NewProxy 创建代理实例
-func NewProxy(pool *backend.BackendPool, timeout time.Duration, maxRetries int, debug bool) *Proxy {
+func NewProxy(r *router.ModelRouter, timeout time.Duration, maxRetries int, debug bool) *Proxy {
 	return &Proxy{
-		pool:       pool,
+		router:     r,
 		timeout:    timeout,
 		maxRetries: maxRetries,
 		debug:      debug,
@@ -73,11 +74,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 检测是否为流式请求
 	isStreaming := detectStreaming(body)
-	log.Printf("[请求 #%d] 流式检测: %v, body 长度: %d 字节", reqID, isStreaming, len(body))
+	// 解析 model 字段，用于按 model 路由到对应后端池
+	model := extractModel(body)
+	log.Printf("[请求 #%d] 流式检测: %v, model: %q, body 长度: %d 字节", reqID, isStreaming, model, len(body))
 	if isStreaming {
-		p.handleStreaming(w, r, body, reqID)
+		p.handleStreaming(w, r, body, reqID, model)
 	} else {
-		p.handleRequest(w, r, body, reqID)
+		p.handleRequest(w, r, body, reqID, model)
 	}
 }
 
@@ -113,11 +116,31 @@ func detectStreaming(body []byte) bool {
 	return req.Stream
 }
 
+// extractModel 解析请求体中的 model 字段，用于按 model 路由到对应后端池
+// 无法解析或字段缺失时返回空串，交由 router 落到默认池
+func extractModel(body []byte) string {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	return req.Model
+}
+
 // ============================================================================
 // 非流式请求：带重试的代理转发
 // ============================================================================
 
-func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byte, reqID uint64) {
+func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byte, reqID uint64, model string) {
+	// 按 model 路由到对应后端池（未匹配则落默认池）
+	pool := p.router.Route(model)
+	if pool == nil {
+		metrics.RecordGatewayError("no_healthy_backend")
+		writeError(w, http.StatusServiceUnavailable, "no backend pool available for this model")
+		return
+	}
+
 	var lastErr error
 	tried := make(map[string]bool)
 
@@ -125,9 +148,9 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 		// 选择后端（重试时排除已失败的）
 		var backend *backend.Backend
 		if attempt == 0 {
-			backend = p.pool.Next()
+			backend = pool.Next()
 		} else {
-			backend = p.pool.NextExcluding(tried)
+			backend = pool.NextExcluding(tried)
 		}
 
 		if backend == nil {
@@ -186,7 +209,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 		written, _ := io.Copy(w, resp.Body)
 
 		// 记录指标
-		metrics.RecordRequest(backend.Name, resp.StatusCode, duration, written)
+		metrics.RecordRequest(model, backend.Name, resp.StatusCode, duration, written)
 
 		log.Printf("[请求 #%d] %s → %s %d (%.1fms, %d bytes, attempt %d/%d)",
 			reqID, r.URL.Path, backend.Name, resp.StatusCode,
@@ -206,8 +229,15 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 // 流式请求（SSE）：逐块转发，不做缓冲
 // ============================================================================
 
-func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []byte, reqID uint64) {
-	backend := p.pool.Next()
+func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []byte, reqID uint64, model string) {
+	// 按 model 路由到对应后端池（未匹配则落默认池）
+	pool := p.router.Route(model)
+	if pool == nil {
+		metrics.RecordGatewayError("no_healthy_backend")
+		writeError(w, http.StatusServiceUnavailable, "no backend pool available for this model")
+		return
+	}
+	backend := pool.Next()
 	if backend == nil {
 		metrics.RecordGatewayError("no_healthy_backend")
 		writeError(w, http.StatusServiceUnavailable, "no healthy backends available")
@@ -269,7 +299,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(errBody)
-		metrics.RecordRequest(backend.Name, resp.StatusCode, time.Since(start), int64(len(errBody)))
+		metrics.RecordRequest(model, backend.Name, resp.StatusCode, time.Since(start), int64(len(errBody)))
 		log.Printf("[SSE #%d] %s → %s 返回错误 %d", reqID, r.URL.Path, backend.Name, resp.StatusCode)
 		return
 	}
@@ -287,7 +317,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		// 降级：回退到非流式模式（一次性返回所有内容）
 		w.WriteHeader(resp.StatusCode)
 		written, _ := io.Copy(w, resp.Body)
-		metrics.RecordRequest(backend.Name, resp.StatusCode, time.Since(start), written)
+		metrics.RecordRequest(model, backend.Name, resp.StatusCode, time.Since(start), written)
 		log.Printf("[SSE #%d] Flusher 不支持，降级为非流式 (%d bytes)", reqID, written)
 		return
 	}
@@ -316,7 +346,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 	}
 
 	metrics.RecordSSEConnectionClosed()
-	metrics.RecordRequest(backend.Name, resp.StatusCode, time.Since(start), totalBytes)
+	metrics.RecordRequest(model, backend.Name, resp.StatusCode, time.Since(start), totalBytes)
 	log.Printf("[SSE #%d] %s → %s %d (%.1fs, %d bytes)",
 		reqID, r.URL.Path, backend.Name, resp.StatusCode,
 		time.Since(start).Seconds(), totalBytes)
@@ -328,8 +358,8 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 
 // HealthHandler 网关自身健康检查
 func (p *Proxy) HealthHandler(w http.ResponseWriter, r *http.Request) {
-	healthy := p.pool.HealthyCount()
-	total := len(p.pool.Backends())
+	healthy := p.router.HealthyCount()
+	total := p.router.TotalCount()
 
 	w.Header().Set("Content-Type", "application/json")
 	if healthy == 0 && total > 0 {
@@ -352,7 +382,7 @@ func (p *Proxy) HealthHandler(w http.ResponseWriter, r *http.Request) {
 // BackendsHandler 查看后端详情（调试用）
 func (p *Proxy) BackendsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	backends := p.pool.Backends()
+	backends := p.router.AllBackends()
 
 	type backendStatus struct {
 		Name    string  `json:"name"`
@@ -375,7 +405,7 @@ func (p *Proxy) BackendsHandler(w http.ResponseWriter, r *http.Request) {
 
 // MetricsHandler Prometheus 格式指标输出
 func (p *Proxy) MetricsHandler(w http.ResponseWriter, r *http.Request) {
-	metrics.WriteMetrics(w, p.pool)
+	metrics.WriteMetrics(w, p.router.Pools())
 }
 
 // ========== 工具函数 ==========

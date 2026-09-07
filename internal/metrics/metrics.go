@@ -36,16 +36,19 @@ var (
 	retryCount atomic.Int64
 )
 
-// recordRequest 记录一次成功代理请求的指标
-func RecordRequest(backend string, statusCode int, duration time.Duration, bytesWritten int64) {
+// RecordRequest 记录一次成功代理请求的指标（按 model+backend+status 归因）
+func RecordRequest(model, backendName string, statusCode int, duration time.Duration, bytesWritten int64) {
+	if model == "" {
+		model = "unknown"
+	}
 	totalRequests.Add(1)
 
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 
-	key := backend + "|" + strconv.Itoa(statusCode)
+	key := model + "|" + backendName + "|" + strconv.Itoa(statusCode)
 	requestCount[key]++
-	requestLatency[backend] = duration.Seconds()
+	requestLatency[backendName] = duration.Seconds()
 }
 
 // recordGatewayError 记录网关层错误
@@ -74,8 +77,8 @@ func RecordRetry() {
 	retryCount.Add(1)
 }
 
-// WriteMetrics 输出 Prometheus 兼容格式的指标
-func WriteMetrics(w io.Writer, pool *backend.BackendPool) {
+// WriteMetrics 输出 Prometheus 兼容格式的指标（接收多后端池）
+func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 
@@ -91,15 +94,22 @@ func WriteMetrics(w io.Writer, pool *backend.BackendPool) {
 	sb.WriteString("\n# HELP inference_gateway_requests_total 代理请求总数（按后端+状态码）\n")
 	sb.WriteString("# TYPE inference_gateway_requests_total counter\n")
 	for key, count := range requestCount {
-		parts := strings.SplitN(key, "|", 2)
-		backend := parts[0]
+		parts := strings.SplitN(key, "|", 3)
+		model := "unknown"
+		backendName := "unknown"
 		statusCode := "unknown"
+		if len(parts) > 0 {
+			model = parts[0]
+		}
 		if len(parts) > 1 {
-			statusCode = parts[1]
+			backendName = parts[1]
+		}
+		if len(parts) > 2 {
+			statusCode = parts[2]
 		}
 		sb.WriteString(fmt.Sprintf(
-			`inference_gateway_requests_total{backend="%s",status_code="%s"} %d`+"\n",
-			backend, statusCode, count))
+			`inference_gateway_requests_total{model="%s",backend="%s",status_code="%s"} %d`+"\n",
+			model, backendName, statusCode, count))
 	}
 	if len(requestCount) == 0 {
 		sb.WriteString("# (尚无请求)\n")
@@ -130,15 +140,16 @@ func WriteMetrics(w io.Writer, pool *backend.BackendPool) {
 	// 后端健康状态
 	sb.WriteString("\n# HELP inference_gateway_backend_health 后端健康状态（1=健康, 0=不健康）\n")
 	sb.WriteString("# TYPE inference_gateway_backend_health gauge\n")
-	backends := pool.Backends()
-	for _, b := range backends {
-		val := 0
-		if b.IsHealthy() {
-			val = 1
+	for _, pl := range pools {
+		for _, b := range pl.Backends() {
+			val := 0
+			if b.IsHealthy() {
+				val = 1
+			}
+			sb.WriteString(fmt.Sprintf(
+				`inference_gateway_backend_health{backend="%s",url="%s"} %d`+"\n",
+				b.Name, b.URL, val))
 		}
-		sb.WriteString(fmt.Sprintf(
-			`inference_gateway_backend_health{backend="%s",url="%s"} %d`+"\n",
-			b.Name, b.URL, val))
 	}
 
 	// 健康检查延迟
@@ -153,11 +164,13 @@ func WriteMetrics(w io.Writer, pool *backend.BackendPool) {
 
 	sb.WriteString("\n# HELP inference_gateway_backend_latency_seconds 健康检查延迟（秒）\n")
 	sb.WriteString("# TYPE inference_gateway_backend_latency_seconds gauge\n")
-	for _, b := range backends {
-		lat := float64(b.Latency) / float64(time.Second)
-		sb.WriteString(fmt.Sprintf(
-			`inference_gateway_backend_latency_seconds{backend="%s",url="%s"} %.6f`+"\n",
-			b.Name, b.URL, lat))
+	for _, pl := range pools {
+		for _, b := range pl.Backends() {
+			lat := float64(b.Latency) / float64(time.Second)
+			sb.WriteString(fmt.Sprintf(
+				`inference_gateway_backend_latency_seconds{backend="%s",url="%s"} %.6f`+"\n",
+				b.Name, b.URL, lat))
+		}
 	}
 
 	w.Write([]byte(sb.String()))

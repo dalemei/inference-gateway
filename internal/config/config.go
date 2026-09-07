@@ -8,8 +8,16 @@ import (
 
 // Config 网关完整配置
 type Config struct {
-	Gateway  GatewayConfig   `yaml:"gateway"`
-	Backends []BackendConfig `yaml:"backends"`
+	Gateway    GatewayConfig   `yaml:"gateway"`
+	Backends   []BackendConfig `yaml:"backends"`
+	Models     []ModelConfig   `yaml:"models"`      // model 名 → 后端池 映射
+	DefaultPool string         `yaml:"default_pool"` // 未匹配 model 的兜底池
+}
+
+// ModelConfig 映射一个模型名到某个后端池
+type ModelConfig struct {
+	Name string `yaml:"name"` // 模型名，如 "qwen2.5-7b"
+	Pool string `yaml:"pool"` // 所属后端池名
 }
 
 // GatewayConfig 网关自身配置
@@ -24,6 +32,7 @@ type BackendConfig struct {
 	Name                string `yaml:"name"`                  // 标识名，如 "vllm-4080"
 	URL                 string `yaml:"url"`                   // 后端地址，如 "http://10.0.0.5:8000"
 	HealthCheckInterval string `yaml:"health_check_interval"` // 健康检查间隔，如 "10s"
+	Pool                string `yaml:"pool"`                // 所属后端池名，按 model 路由使用
 }
 
 // LoadConfig 从 YAML 文件加载配置

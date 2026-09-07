@@ -1,4 +1,4 @@
-package main
+package metrics
 
 import (
 	"fmt"
@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/dalemei/inference-gateway/internal/backend"
 )
 
 // ========== 指标数据结构 ==========
@@ -35,7 +37,7 @@ var (
 )
 
 // recordRequest 记录一次成功代理请求的指标
-func recordRequest(backend string, statusCode int, duration time.Duration, bytesWritten int64) {
+func RecordRequest(backend string, statusCode int, duration time.Duration, bytesWritten int64) {
 	totalRequests.Add(1)
 
 	metricsMu.Lock()
@@ -47,7 +49,7 @@ func recordRequest(backend string, statusCode int, duration time.Duration, bytes
 }
 
 // recordGatewayError 记录网关层错误
-func recordGatewayError(errorType string) {
+func RecordGatewayError(errorType string) {
 	totalErrors.Add(1)
 
 	metricsMu.Lock()
@@ -57,23 +59,23 @@ func recordGatewayError(errorType string) {
 }
 
 // recordSSEConnection SSE 连接建立
-func recordSSEConnection() {
+func RecordSSEConnection() {
 	sseConnectionsActive.Add(1)
 	sseConnectionsTotal.Add(1)
 }
 
 // recordSSEConnectionClosed SSE 连接关闭
-func recordSSEConnectionClosed() {
+func RecordSSEConnectionClosed() {
 	sseConnectionsActive.Add(-1)
 }
 
 // recordRetry 记录一次重试
-func recordRetry() {
+func RecordRetry() {
 	retryCount.Add(1)
 }
 
-// writeMetrics 输出 Prometheus 兼容格式的指标
-func writeMetrics(w io.Writer, pool *BackendPool) {
+// WriteMetrics 输出 Prometheus 兼容格式的指标
+func WriteMetrics(w io.Writer, pool *backend.BackendPool) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 

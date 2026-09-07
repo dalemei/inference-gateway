@@ -10,6 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/dalemei/inference-gateway/internal/backend"
+	"github.com/dalemei/inference-gateway/internal/config"
+	"github.com/dalemei/inference-gateway/internal/proxy"
 )
 
 func main() {
@@ -18,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	// 加载配置
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
@@ -35,16 +39,16 @@ func main() {
 	}
 
 	// 创建后端池
-	pool := NewBackendPool()
+	pool := backend.NewBackendPool()
 	for _, bc := range cfg.Backends {
 		interval, err := time.ParseDuration(bc.HealthCheckInterval)
 		if err != nil || interval == 0 {
 			interval = 10 * time.Second
 		}
 
-		backend := NewBackend(bc.Name, bc.URL, interval, timeout)
-		pool.Add(backend)
-		backend.StartHealthCheck()
+		be := backend.NewBackend(bc.Name, bc.URL, interval, timeout)
+		pool.Add(be)
+		be.StartHealthCheck()
 
 		log.Printf("[后端] %s (%s) — 健康检查间隔: %v", bc.Name, bc.URL, interval)
 	}
@@ -54,18 +58,18 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	// 创建代理
-	proxy := NewProxy(pool, timeout, cfg.Gateway.MaxRetries, *debug)
+	gw := proxy.NewProxy(pool, timeout, cfg.Gateway.MaxRetries, *debug)
 
 	// ====== 路由注册 ======
 	mux := http.NewServeMux()
 
 	// 网关自身端点
-	mux.HandleFunc("/health", proxy.HealthHandler)
-	mux.HandleFunc("/metrics", proxy.MetricsHandler)
-	mux.HandleFunc("/backends", proxy.BackendsHandler)
+	mux.HandleFunc("/health", gw.HealthHandler)
+	mux.HandleFunc("/metrics", gw.MetricsHandler)
+	mux.HandleFunc("/backends", gw.BackendsHandler)
 
 	// 所有其他路径 → 代理转发到 vLLM
-	mux.HandleFunc("/", proxy.ServeHTTP)
+	mux.HandleFunc("/", gw.ServeHTTP)
 
 	// ====== 启动服务器 ======
 	addr := fmt.Sprintf(":%d", cfg.Gateway.Port)

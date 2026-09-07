@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"bytes"
@@ -14,6 +14,9 @@ import (
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
+
+	"github.com/dalemei/inference-gateway/internal/backend"
+	"github.com/dalemei/inference-gateway/internal/metrics"
 )
 
 // requestIDCounter 自增请求 ID 计数器
@@ -21,7 +24,7 @@ var requestIDCounter atomic.Uint64
 
 // Proxy 推理请求代理，负责接收客户端请求并转发到健康后端
 type Proxy struct {
-	pool       *BackendPool
+	pool       *backend.BackendPool
 	timeout    time.Duration
 	maxRetries int
 	debug      bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
@@ -29,7 +32,7 @@ type Proxy struct {
 }
 
 // NewProxy 创建代理实例
-func NewProxy(pool *BackendPool, timeout time.Duration, maxRetries int, debug bool) *Proxy {
+func NewProxy(pool *backend.BackendPool, timeout time.Duration, maxRetries int, debug bool) *Proxy {
 	return &Proxy{
 		pool:       pool,
 		timeout:    timeout,
@@ -120,7 +123,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 
 	for attempt := 0; attempt <= p.maxRetries; attempt++ {
 		// 选择后端（重试时排除已失败的）
-		var backend *Backend
+		var backend *backend.Backend
 		if attempt == 0 {
 			backend = p.pool.Next()
 		} else {
@@ -128,7 +131,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 		}
 
 		if backend == nil {
-			recordGatewayError("no_healthy_backend")
+			metrics.RecordGatewayError("no_healthy_backend")
 			log.Printf("[请求 #%d] 无可用健康后端 (已尝试: %v)", reqID, triedKeys(tried))
 			writeError(w, http.StatusServiceUnavailable, "no healthy backends available")
 			return
@@ -162,10 +165,10 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 			lastErr = err
 			log.Printf("[请求 #%d] %s → %s 失败 (attempt %d/%d): %v",
 				reqID, r.URL.Path, backend.Name, attempt+1, p.maxRetries+1, err)
-			recordGatewayError("backend_unreachable")
+			metrics.RecordGatewayError("backend_unreachable")
 			// 仅当还有剩余重试次数时才计入重试次数（最后一次失败不再重试）
 			if attempt < p.maxRetries {
-				recordRetry()
+				metrics.RecordRetry()
 			}
 			continue // 重试
 		}
@@ -183,7 +186,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 		written, _ := io.Copy(w, resp.Body)
 
 		// 记录指标
-		recordRequest(backend.Name, resp.StatusCode, duration, written)
+		metrics.RecordRequest(backend.Name, resp.StatusCode, duration, written)
 
 		log.Printf("[请求 #%d] %s → %s %d (%.1fms, %d bytes, attempt %d/%d)",
 			reqID, r.URL.Path, backend.Name, resp.StatusCode,
@@ -193,7 +196,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 	}
 
 	// 所有重试均失败
-	recordGatewayError("all_retries_failed")
+	metrics.RecordGatewayError("all_retries_failed")
 	log.Printf("[请求 #%d] 所有重试均失败 (已尝试: %v, 最后错误: %v)", reqID, triedKeys(tried), lastErr)
 	writeError(w, http.StatusBadGateway,
 		fmt.Sprintf("all %d backends unreachable, last error: %v", len(tried), lastErr))
@@ -206,7 +209,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []byte, reqID uint64) {
 	backend := p.pool.Next()
 	if backend == nil {
-		recordGatewayError("no_healthy_backend")
+		metrics.RecordGatewayError("no_healthy_backend")
 		writeError(w, http.StatusServiceUnavailable, "no healthy backends available")
 		return
 	}
@@ -248,7 +251,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 	resp, err := streamClient.Do(proxyReq)
 	if err != nil {
 		log.Printf("[SSE #%d] %s → %s 连接失败: %v", reqID, r.URL.Path, backend.Name, err)
-		recordGatewayError("backend_unreachable")
+		metrics.RecordGatewayError("backend_unreachable")
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("backend %s unreachable: %v", backend.Name, err))
 		return
 	}
@@ -266,7 +269,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(errBody)
-		recordRequest(backend.Name, resp.StatusCode, time.Since(start), int64(len(errBody)))
+		metrics.RecordRequest(backend.Name, resp.StatusCode, time.Since(start), int64(len(errBody)))
 		log.Printf("[SSE #%d] %s → %s 返回错误 %d", reqID, r.URL.Path, backend.Name, resp.StatusCode)
 		return
 	}
@@ -284,13 +287,13 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		// 降级：回退到非流式模式（一次性返回所有内容）
 		w.WriteHeader(resp.StatusCode)
 		written, _ := io.Copy(w, resp.Body)
-		recordRequest(backend.Name, resp.StatusCode, time.Since(start), written)
+		metrics.RecordRequest(backend.Name, resp.StatusCode, time.Since(start), written)
 		log.Printf("[SSE #%d] Flusher 不支持，降级为非流式 (%d bytes)", reqID, written)
 		return
 	}
 
 	w.WriteHeader(resp.StatusCode)
-	recordSSEConnection()
+	metrics.RecordSSEConnection()
 
 	var totalBytes int64
 	buf := make([]byte, 4096)
@@ -312,8 +315,8 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		}
 	}
 
-	recordSSEConnectionClosed()
-	recordRequest(backend.Name, resp.StatusCode, time.Since(start), totalBytes)
+	metrics.RecordSSEConnectionClosed()
+	metrics.RecordRequest(backend.Name, resp.StatusCode, time.Since(start), totalBytes)
 	log.Printf("[SSE #%d] %s → %s %d (%.1fs, %d bytes)",
 		reqID, r.URL.Path, backend.Name, resp.StatusCode,
 		time.Since(start).Seconds(), totalBytes)
@@ -372,7 +375,7 @@ func (p *Proxy) BackendsHandler(w http.ResponseWriter, r *http.Request) {
 
 // MetricsHandler Prometheus 格式指标输出
 func (p *Proxy) MetricsHandler(w http.ResponseWriter, r *http.Request) {
-	writeMetrics(w, p.pool)
+	metrics.WriteMetrics(w, p.pool)
 }
 
 // ========== 工具函数 ==========

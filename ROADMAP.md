@@ -16,14 +16,15 @@
 | Day | 状态 | 标题（commit 风格） | 改什么 | 文件 | 难度 |
 |-----|------|-------------------|--------|------|------|
 | 1 | ✅ | fix: 重试计数器未累加 | 重试循环补 `recordRetry()` | proxy.go | ⭐ |
+| — | ✅ | *Day 8 / Day 9 已提前完成，合入 `e55501e`（健康检查独立短超时 + Latency 原子化）* | | | |
 | 2 | ✅ | fix: 暴露请求级延迟指标 | 新增 `backend_request_latency_seconds` | metrics.go | ⭐ |
 | 3 | ✅ | refactor: 移除 SSE body HEX dump | 删/加开关控制调试日志（性能+隐私） | proxy.go L224-232 | ⭐ |
 | 4 | ✅ | fix: 优雅关闭改用 Shutdown(ctx) | 流式连接不再被瞬间切断 | main.go L79-86 | ⭐⭐ |
 | 5 | ⬜ | test: detectStreaming / ensureUTF8 单测 | 新建 `proxy_test.go` | 新测试文件 | ⭐⭐ |
 | 6 | ⬜ | test: BackendPool round-robin 单测 | 全不健康→nil、排除集合逻辑 | 新测试文件 | ⭐⭐ |
 | 7 | ⬜ | feat: 新增 inflight 请求数 gauge | ServeHTTP 起止各 ±1（atomic） | proxy.go / metrics.go | ⭐ |
-| 8 | ⬜ | fix: Backend.Latency 改为 atomic.Int64 | 修 data race（并发读） | backend.go | ⭐⭐ |
-| 9 | ⬜ | perf: 健康检查独立短超时 | 不再复用网关 60s 超时 | backend.go NewBackend | ⭐⭐ |
+| 8 | ✅ | fix: Backend.Latency 改为 atomic.Int64 | 修 data race（并发读） | backend.go | ⭐⭐ |
+| 9 | ✅ | perf: 健康检查独立短超时 | 不再复用网关 60s 超时 | backend.go NewBackend | ⭐⭐ |
 | 10 | ⬜ | feat: 请求耗时均值指标 | 复用 requestLatency 做 sum/count | metrics.go | ⭐ |
 | 11 | ⬜ | test: httptest 假后端集成测试 | 验证转发+重试全链路 | 新测试文件 | ⭐⭐⭐ |
 | 12 | ⬜ | fix: 转发时剥离 Accept-Encoding | 避免双重压缩 bug | proxy.go copyHeaders | ⭐⭐ |
@@ -84,24 +85,45 @@
 - `d6c8b35` refactor: 按 cmd/internal 结构拆分包，更新代码结构
 - `3a21171` feat: 按 model 路由到不同后端池，指标加 model 标签  ⚠️ **尚未 push**
 
-## 待提交（2026-09-15 本机 Ollama 实测后修复，未 commit）
+## 待提交（2026-09-15）
 
-实测发现 3 个真实缺陷并已修复，改动 6 个文件（+99/-16），`go vet` / `go build` 均通过。
-建议拆成 3 个 commit（遵循一日一 commit、改动可独立回滚）：
+本机 Ollama 实测 + 开 GPU 前的一轮完整代码走读，共挖出 **6 个真实缺陷并全部修复**。
+改动 **21 个文件（+1210/-28）**，`go vet` / `go build` / 交叉编译 linux-amd64 均通过，本机 Ollama 端到端回归全绿。
+明细与实测证据见 `TESTING.md` §3.9 / §3.10 / §3.12。
 
-1. `feat: 健康检查路径与超时可配置` — 各推理引擎健康检查约定不一（vLLM/TGI=`/health`、Ollama=`/`）
-2. `fix: 后端返回 429/502/503/504 时换节点重试` — 此前只有网络错误才重试
-3. `fix: errors_total 输出运行期新增类型` — 修复新错误类型被静默丢弃的埋点废点
+### 第一批：实测挖出的功能缺陷
 
-明细与实测证据见 `TESTING.md` §3.9 / §3.10。
+1. `feat: 健康检查路径与超时可配置` — 各引擎健康检查约定不一（vLLM/TGI=`/health`、Ollama=`/`、SGLang=`/health_generate`），此前写死 `/health` 导致 Ollama 永远 unhealthy
+2. `fix: 后端返回 429/502/503/504 时换节点重试` — 此前只有网络错误才重试，5xx 被无条件透传
+3. `fix: errors_total 输出运行期新增类型` — 修复新错误类型被静默丢弃的「埋点废点」
 
-## 第二批：性能与并发正确性（2026-09-15 晚，同样未 commit）
+### 第二批：性能与并发正确性
 
-开 GPU 前做了一轮完整代码走读，先修掉三个**会污染压测数据**的问题（详见 TESTING.md §3.12）：
+4. `perf: 连接池 MaxIdleConnsPerHost 默认只有 2 → 100` — 不调大则压出来的"网关开销"其实是"建连开销"，压测数据不可信
+5. `fix: Backend.Latency 改 atomic.Int64` — 健康检查写 / metrics 读，原本是 data race（ROADMAP Day 8 事项提前做掉）
+6. `fix: 健康检查读完 body 再 Close` — 只 Close 不读，连接无法归还池，长期运行积累 TIME_WAIT
 
-4. `perf: 连接池 MaxIdleConnsPerHost 默认只有 2 → 100`（网关只连少数后端，不调大连复用率上不去，压出来的"网关开销"其实是"建连开销"）
-5. `fix: Backend.Latency 改 atomic.Int64`（健康检查写 / metrics 读，原本是 data race，ROADMAP Day 8 已列未做）
-6. `fix: 健康检查读完 body 再 Close`（只 Close 不读，连接无法归还池，长期运行积累 TIME_WAIT）
+### 第三批：文档与工程资产
 
-本机 Ollama 回归验证通过（health / backends latency_ms=2.06 / chat 200 / 并发 20 轮读指标无异常）。
-`-race` 检测本机跑不了（无 gcc），已写成 `gpu-bench/5_racecheck.sh`，在 AutoDL 上跑。
+7. `docs: 同步 README/config.yaml 到当前结构` — 补 `health_check_path` / `health_check_timeout` 说明与各引擎健康端点对照表；**修正 `go build .` → `go build ./cmd/gateway`**（包拆分后原命令已失效，clone 者第一步即失败）
+8. `test: 新增 gpu-bench/ AutoDL GPU 实测夹具` — env.sh / 起 vLLM / 起网关 / 直连对比压测 / 故障切换 / race 检测，共 8 个文件
+
+### 建议最终拆 4 个 commit
+
+```
+1. fix(healthcheck): 健康探测三大问题 — 路径可配置 + Latency 原子化 + 读完 body
+   internal/config/config.go  internal/backend/backend.go  cmd/gateway/main.go
+
+2. fix(proxy): 后端 429/502/503/504 换节点重试 + errors_total 动态输出
+   internal/proxy/proxy.go  internal/metrics/metrics.go
+
+3. perf(proxy): MaxIdleConnsPerHost 2 → 100
+   internal/proxy/proxy.go
+
+4. chore+docs+test: go.mod indirect 修正、.gitignore、gpu-bench 实测夹具、README/config.yaml 同步、TESTING.md
+```
+
+> ⚠️ 注意：2 和 3 都改 `internal/proxy/proxy.go`，1 内部也混合了多个主题。
+> 若要严格按上面 4 个 commit 拆，需用 `git add -p` 按 hunk 暂存；嫌麻烦可合并为 2 个 commit（第一批+文档、第二批+压测夹具）。
+
+`-race` 检测本机跑不了（Windows 无 gcc，`-race requires cgo`），已写成 `gpu-bench/5_racecheck.sh`，在 AutoDL 上跑，通过后在 README 标 race-clean。

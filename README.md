@@ -61,7 +61,7 @@
 ```bash
 git clone https://github.com/你的用户名/inference-gateway.git
 cd inference-gateway
-go build -o inference-gateway .
+go build -o inference-gateway ./cmd/gateway
 ```
 
 ### 2. 配置后端
@@ -116,16 +116,37 @@ gateway:
   max_retries: 1      # 失败重试次数（0=不重试）
 
 backends:
-  - name: "vllm-node-1"              # 标识名，出现在日志和指标中
-    url: "http://192.168.1.101:8000" # vLLM 地址
-    health_check_interval: "10s"     # 健康检查间隔
+  - name: "vllm-node-1"               # 标识名，出现在日志和指标中
+    url: "http://192.168.1.101:8000"  # 后端地址
+    health_check_path: "/health"      # 健康检查路径（默认 /health）
+    health_check_timeout: "3s"        # 健康探测独立超时（默认 3s）
+    health_check_interval: "10s"      # 健康检查间隔
+    pool: "default"                   # 所属后端池
 
   - name: "vllm-node-2"
     url: "http://192.168.1.102:8000"
+    health_check_path: "/health"
+    health_check_timeout: "3s"
     health_check_interval: "10s"
+    pool: "default"
 ```
 
 > 多后端时网关自动 round-robin 轮询。一个后端挂了，请求自动路由到其他健康节点。
+
+### 健康检查路径：各家引擎约定不同
+
+这是接入非 vLLM 后端时最容易踩的坑——**网关默认探 `/health`，但并不是所有引擎都有这个端点**。探错了端点，网关会一直把活着的后端判定为 unhealthy：
+
+| 推理引擎 | 健康检查路径 | 备注 |
+|----------|-------------|------|
+| vLLM | `/health` | 默认值，无需配置 |
+| TGI (text-generation-inference) | `/health` | 默认值 |
+| **Ollama** | `/` | 必须显式配 `health_check_path: "/"` |
+| SGLang | `/health_generate` | 会真实跑一次生成，比 `/health` 严格 |
+
+`health_check_timeout` 默认 3s，**故意不复用 `gateway.timeout`**（后者通常设 120s 以适应慢推理）——若复用，一个卡死的后端会让探测 goroutine 长期挂起，健康状态无法及时翻转。
+
+> 另一个常见坑：**`url` 不要带 `/v1` 后缀**。网关转发时是「后端 URL + 原始请求路径」，OpenAI 客户端发来的路径本身已含 `/v1`，写进 url 会拼成 `/v1/v1/chat/completions` 返回 404。
 
 ---
 

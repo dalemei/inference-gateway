@@ -4,7 +4,7 @@
 #   - 多后端轮询负载均衡（round-robin）
 #   - 失败自动重试（跳过已失败后端）
 #   - SSE 流式代理（stream=true 时透传）
-#   - 自动健康检查（/health 端点探测）
+#   - 自动健康检查（health_check_path 可配置，适配各家引擎约定）
 #   - Prometheus 指标暴露（/metrics）
 #   - 后端状态查看（/backends）
 #   - 超时控制 + 结构化日志（含 X-Request-ID）
@@ -27,14 +27,22 @@ backends:
   #   url 填: http://<AutoDL_公网IP>:<暴露端口>
   #
   # pool 字段指定该后端归属的后端池，按 model 路由时生效
+  #
+  # health_check_path / health_check_timeout 均可省略：
+  #   health_check_path    默认 "/health"（vLLM / TGI）
+  #                        Ollama 需填 "/"，SGLang 需填 "/health_generate"
+  #   health_check_timeout 默认 "3s"（刻意不复用 gateway.timeout，避免慢后端拖死探测）
   - name: "auto-vllm-4080"
     url: "http://localhost:8000"     # ← 修改为实际地址
     health_check_interval: "10s"
     pool: "default"                  # 归属默认池
 
   # 第二个后端池示例：本地 Ollama（去掉注释即可启用）
+  # 注意 Ollama 的健康端点与 vLLM 不同，必须显式指定 health_check_path
   # - name: "ollama-local"
   #   url: "http://localhost:11434"
+  #   health_check_path: "/"
+  #   health_check_timeout: "3s"
   #   health_check_interval: "15s"
   #   pool: "local"
 
@@ -53,7 +61,7 @@ models:
 # 
 # 1. 在本机（Windows）启动网关:
 #    cd inference-gateway
-#    go run . --config config.yaml
+#    go run ./cmd/gateway --config config.yaml
 #
 # 2. 普通请求测试:
 #    curl http://localhost:8080/v1/chat/completions \

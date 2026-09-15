@@ -3,6 +3,7 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,9 +119,25 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 	// 错误计数
 	sb.WriteString("\n# HELP inference_gateway_errors_total 网关层错误总数（按类型）\n")
 	sb.WriteString("# TYPE inference_gateway_errors_total counter\n")
-	for _, t := range []string{"no_healthy_backend", "backend_unreachable", "all_retries_failed"} {
+	// 先输出已知类型（即使为 0 也输出，保证告警规则的标签组合始终存在），
+	// 再输出运行期新增的类型。若只写死已知类型，新错误类型会被累加进 map 却
+	// 永不输出——等于埋了一个看不见的点（本仓库此前踩过的「埋点废点」）。
+	seen := make(map[string]bool, 8)
+	for _, t := range []string{"no_healthy_backend", "backend_unreachable", "all_retries_failed", "retryable_status"} {
 		count := errorCount[t]
 		sb.WriteString(fmt.Sprintf(`inference_gateway_errors_total{type="%s"} %d`+"\n", t, count))
+		seen[t] = true
+	}
+	// 其余运行期出现的类型按字典序输出，保证多次抓取结果稳定可比对
+	var extra []string
+	for t := range errorCount {
+		if !seen[t] {
+			extra = append(extra, t)
+		}
+	}
+	sort.Strings(extra)
+	for _, t := range extra {
+		sb.WriteString(fmt.Sprintf(`inference_gateway_errors_total{type="%s"} %d`+"\n", t, errorCount[t]))
 	}
 
 	// 重试计数
@@ -166,7 +183,7 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 	sb.WriteString("# TYPE inference_gateway_backend_latency_seconds gauge\n")
 	for _, pl := range pools {
 		for _, b := range pl.Backends() {
-			lat := float64(b.Latency) / float64(time.Second)
+			lat := float64(b.Latency.Load()) / float64(time.Second)
 			sb.WriteString(fmt.Sprintf(
 				`inference_gateway_backend_latency_seconds{backend="%s",url="%s"} %.6f`+"\n",
 				b.Name, b.URL, lat))

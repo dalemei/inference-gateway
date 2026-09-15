@@ -1,0 +1,31 @@
+# AutoDL GPU 实测配置：N 个 vLLM 副本 + 网关同机部署
+# 生成方式：bash gpu-bench/make_config.sh（按 env.sh 的 REPLICAS 自动展开）
+# 手工改也行，注意两点：
+#   1) url 只填根地址，不要带 /v1（转发 = URL + 请求路径，客户端路径自带 /v1）
+#   2) vLLM 健康检查端点就是 /health
+
+gateway:
+  port: 8080
+  timeout: "300s"        # 并发压测时排队可能很久，给足
+  max_retries: 1         # 2 副本场景：失败换另一个副本
+
+default_pool: "default"
+
+backends:
+  - name: "vllm-8000"
+    url: "http://127.0.0.1:8000"
+    health_check_path: "/health"
+    health_check_timeout: "5s"
+    health_check_interval: "5s"
+    pool: "default"
+
+  - name: "vllm-8001"
+    url: "http://127.0.0.1:8001"
+    health_check_path: "/health"
+    health_check_timeout: "5s"
+    health_check_interval: "5s"
+    pool: "default"
+
+models:
+  - name: "qwen2.5-7b"
+    pool: "default"

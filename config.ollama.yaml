@@ -1,0 +1,39 @@
+# 本机 Ollama 实测配置（不依赖 GPU，零成本验证真实后端转发）
+#
+# 关键点：Ollama **没有 /health 端点**（实测 404），只有 / 与 /v1/models 返回 200。
+# 因此必须显式配置 health_check_path，否则后端永远判定为不健康。
+# 各家推理引擎健康检查约定对照：
+#   vLLM     → /health
+#   TGI      → /health
+#   Ollama   → /  （OpenAI 兼容前缀下可用 /v1/models）
+#   SGLang   → /health_generate
+
+gateway:
+  port: 8080
+  timeout: "120s"      # CPU 推理较慢，给足超时
+  max_retries: 1
+
+default_pool: "default"
+
+backends:
+  # 韧性验证用：健康检查 200 但推理一律 500，观察网关是否 NextExcluding 跳过它
+  - name: "fake-broken"
+    url: "http://127.0.0.1:9999"
+    health_check_path: "/"
+    health_check_timeout: "3s"
+    health_check_interval: "10s"
+    pool: "default"
+
+  - name: "ollama-main"
+    # 注意：URL 只填「根地址」，不要带 /v1。
+    # 转发规则是 URL + 请求路径，而 OpenAI 客户端请求的路径本身已含 /v1
+    # （/v1/chat/completions），若 URL 再写 /v1 会拼成 /v1/v1/... 导致 404。
+    url: "http://127.0.0.1:11434"
+    health_check_path: "/"              # Ollama 只有 / 返回 200，无 /health
+    health_check_timeout: "3s"          # 独立短超时，不复用 120s 请求超时
+    health_check_interval: "10s"
+    pool: "default"
+
+models:
+  - name: "qwen2.5:1.5b"
+    pool: "default"

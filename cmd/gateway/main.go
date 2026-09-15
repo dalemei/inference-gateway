@@ -62,11 +62,17 @@ func main() {
 			interval = 10 * time.Second
 		}
 
-		be := backend.NewBackend(bc.Name, bc.URL, interval, timeout)
+		healthTimeout, err := time.ParseDuration(bc.HealthCheckTimeout)
+		if err != nil || healthTimeout <= 0 {
+			healthTimeout = 3 * time.Second
+		}
+
+		be := backend.NewBackend(bc.Name, bc.URL, bc.HealthCheckPath, interval, healthTimeout, timeout)
 		pl.Add(be)
 		be.StartHealthCheck()
 
-		log.Printf("[后端] %s (%s) — 池: %s, 健康检查间隔: %v", bc.Name, bc.URL, poolName, interval)
+		log.Printf("[后端] %s (%s) — 池: %s, 健康检查: %v 间隔 / %v 超时",
+			bc.Name, bc.URL, poolName, interval, healthTimeout)
 	}
 
 	// 映射模型到后端池（未匹配的 model 自动落入默认池）

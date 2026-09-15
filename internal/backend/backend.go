@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -8,33 +9,56 @@ import (
 	"time"
 )
 
-// Backend 表示一个 vLLM 推理后端实例
+// Backend 表示一个推理后端实例（vLLM / Ollama / TGI / SGLang 等）
 type Backend struct {
-	Name    string        // 标识名，如 "vllm-4080"
-	URL     string        // 后端地址，如 "http://10.0.0.5:8000"
-	Healthy atomic.Bool   // 当前健康状态（原子操作，无锁读）
-	Latency time.Duration // 最近一次健康检查延迟（纳秒）
+	Name    string      // 标识名，如 "vllm-4080"
+	URL     string      // 后端地址，如 "http://10.0.0.5:8000"
+	Healthy atomic.Bool // 当前健康状态（原子操作，无锁读）
+	// Latency 最近一次健康检查延迟（纳秒）。
+	// 必须是原子类型：健康检查 goroutine 写、/metrics 与 /backends 读，
+	// 并发访问下普通 time.Duration 是 data race（go test -race 会直接报错）。
+	Latency atomic.Int64
 
+	healthPath     string        // 健康检查路径，各家引擎约定不一，故可配置
 	healthInterval time.Duration
-	client         *http.Client
+	client         *http.Client // 转发请求用，超时 = 网关请求超时
+	healthClient   *http.Client // 健康探测用，独立短超时
 	stopCh         chan struct{}
 	wg             sync.WaitGroup
 }
 
 // NewBackend 创建一个后端实例
-func NewBackend(name, url string, healthInterval, requestTimeout time.Duration) *Backend {
+// healthPath 为空时回退为 "/health"；healthTimeout 为空（<=0）时回退为 3s
+func NewBackend(name, url, healthPath string, healthInterval, healthTimeout, requestTimeout time.Duration) *Backend {
+	if healthPath == "" {
+		healthPath = "/health"
+	}
+	if healthTimeout <= 0 {
+		healthTimeout = 3 * time.Second
+	}
+	newTransport := func() *http.Transport {
+		return &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10, // 默认是 2，网关场景必须调大（理由见 proxy.go）
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  false,
+		}
+	}
 	return &Backend{
 		Name:           name,
 		URL:            url,
 		Healthy:        atomic.Bool{},
+		healthPath:     healthPath,
 		healthInterval: healthInterval,
 		client: &http.Client{
-			Timeout: requestTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        10,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  false,
-			},
+			Timeout:   requestTimeout,
+			Transport: newTransport(),
+		},
+		// 健康探测必须用独立短超时：若复用网关请求超时（可达 120s），
+		// 一个卡死的后端会让探测 goroutine 长期挂起，健康状态无法及时翻转。
+		healthClient: &http.Client{
+			Timeout:   healthTimeout,
+			Transport: newTransport(),
 		},
 		stopCh: make(chan struct{}),
 	}
@@ -69,7 +93,7 @@ func (b *Backend) Stop() {
 // check 执行一次健康探测
 func (b *Backend) check() {
 	start := time.Now()
-	resp, err := b.client.Get(b.URL + "/health")
+	resp, err := b.healthClient.Get(b.URL + b.healthPath)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -78,9 +102,13 @@ func (b *Backend) check() {
 		}
 		return
 	}
+	// 必须先读完 body 再 Close：只 Close 不读，连接无法归还连接池，
+	// 每次探测都要新建 TCP，长期运行会积累大量 TIME_WAIT 连接。
+	// 用 LimitReader 兜底：异常后端可能返回巨大响应体，不能无上限读。
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 	resp.Body.Close()
 
-	b.Latency = duration
+	b.Latency.Store(int64(duration))
 	if resp.StatusCode == http.StatusOK {
 		if !b.Healthy.Swap(true) {
 			log.Printf("[健康检查] %s (%s) → 恢复健康 (延迟: %v)", b.Name, b.URL, duration)

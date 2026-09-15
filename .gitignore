@@ -9,6 +9,11 @@ inference-gateway
 # 测试二进制
 *.test
 
+# 交叉编译产物（Linux 版，供 AutoDL 实测上传用）
+igw-linux-amd64
+igw-smoke
+__pycache__/
+
 # 输出目录
 /output/
 /bin/

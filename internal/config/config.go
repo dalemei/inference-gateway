@@ -27,12 +27,14 @@ type GatewayConfig struct {
 	MaxRetries int    `yaml:"max_retries"` // 失败重试次数（0=不重试，默认 1）
 }
 
-// BackendConfig 单个 vLLM 后端配置
+// BackendConfig 单个推理后端配置
 type BackendConfig struct {
 	Name                string `yaml:"name"`                  // 标识名，如 "vllm-4080"
 	URL                 string `yaml:"url"`                   // 后端地址，如 "http://10.0.0.5:8000"
+	HealthCheckPath     string `yaml:"health_check_path"`     // 健康检查路径，默认 "/health"。各家推理引擎约定不一：vLLM/TGI=/health，Ollama=/，SGLang=/health_generate
+	HealthCheckTimeout  string `yaml:"health_check_timeout"`  // 健康检查独立超时，默认 3s（不复用网关请求超时，避免慢后端拖死探测）
 	HealthCheckInterval string `yaml:"health_check_interval"` // 健康检查间隔，如 "10s"
-	Pool                string `yaml:"pool"`                // 所属后端池名，按 model 路由使用
+	Pool                string `yaml:"pool"`                  // 所属后端池名，按 model 路由使用
 }
 
 // LoadConfig 从 YAML 文件加载配置

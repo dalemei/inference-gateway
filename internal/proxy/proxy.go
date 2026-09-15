@@ -42,7 +42,12 @@ func NewProxy(r *router.ModelRouter, timeout time.Duration, maxRetries int, debu
 		client: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
+				MaxIdleConns: 100,
+				// MaxIdleConnsPerHost 默认是 2，对网关是致命的：
+				// 网关通常只连少数几个后端，并发一上来就会把空闲连接挤掉，
+				// 导致每请求重新建 TCP（+TLS），把「连接建立开销」误算成「网关转发开销」。
+				// 必须与并发量同量级，否则压测数据不可信。
+				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
 				DisableCompression:  false,
 			},
@@ -128,6 +133,30 @@ func extractModel(body []byte) string {
 	return req.Model
 }
 
+// isRetryableStatus 判断后端响应码是否值得「换一个节点」重试。
+//
+// 判定原则：只重试「后端自身过载或临时不可用」，不重试 4xx（请求本身有问题，重试无意义）。
+// 对推理服务而言这几类最常见：
+//
+//	429 Too Many Requests — 后端限流（vLLM 并发打满时返回）
+//	502 Bad Gateway       — 后端上游异常
+//	503 Service Unavailable — 过载 / 模型仍在加载，换节点大概率能成
+//	504 Gateway Timeout   — 后端超时
+//
+// 说明：这里刻意不重试 500。500 在通用网关（Envoy/Nginx 默认）里同样不重试，
+// 因为它更可能是请求本身触发的错误（如 prompt 超长、参数非法），换节点也白搭。
+// 若你的推理集群 500 多为 GPU OOM，可在此加入 http.StatusInternalServerError。
+func isRetryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests,  // 429
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
+		return true
+	}
+	return false
+}
+
 // ============================================================================
 // 非流式请求：带重试的代理转发
 // ============================================================================
@@ -196,6 +225,21 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 			continue // 重试
 		}
 		defer resp.Body.Close()
+
+		// 后端返回「可重试」状态码 → 换一个节点重试。
+		// 必须在写响应头之前判断：一旦 WriteHeader 响应即已提交，无法回头。
+		// 循环内不能用 defer 兜底关闭（defer 累积到函数结束才执行，会泄漏连接），
+		// 故此处显式 Close；后续 defer 的重复 Close 对 http.Body 是幂等的，无副作用。
+		if attempt < p.maxRetries && isRetryableStatus(resp.StatusCode) {
+			resp.Body.Close()
+			metrics.RecordRetry()
+			// 必须留痕：否则这类「被重试挽救的后端故障」在指标里完全隐形，
+			// 运维看 /metrics 会以为一切正常，错过后端正在劣化的信号。
+			metrics.RecordGatewayError("retryable_status")
+			log.Printf("[请求 #%d] %s → %s 返回 %d（可重试），换节点 (attempt %d/%d)",
+				reqID, r.URL.Path, backend.Name, resp.StatusCode, attempt+1, p.maxRetries+1)
+			continue
+		}
 
 		// 复制响应头
 		for key, values := range resp.Header {
@@ -397,7 +441,7 @@ func (p *Proxy) BackendsHandler(w http.ResponseWriter, r *http.Request) {
 			Name:    b.Name,
 			URL:     b.URL,
 			Healthy: b.IsHealthy(),
-			Latency: float64(b.Latency.Microseconds()) / 1000,
+			Latency: float64(b.Latency.Load()) / 1e6, // 纳秒 → 毫秒
 		})
 	}
 	json.NewEncoder(w).Encode(result)

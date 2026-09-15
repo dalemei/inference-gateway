@@ -2,7 +2,9 @@
 
 > 目标：每周至少向本仓库提交 1 个**有质量的 commit**，质量优先，保持可持续节奏。
 > 原则：每天 1 个干净 commit，改动小、可编译、可测试。每完成一天在下方表格勾掉。
-> 当前进度：**Day 1–3 已完成**（见文末 commit 记录）。
+> 当前进度：**Day 1–4 已完成**（见文末 commit 记录）。
+> 2026-09-15 补充：Day 4 之后另有 4 个架构性 commit（LICENSE / module path / cmd+internal 重构 / model 路由），
+> 详见文末「已完成 commit 记录」。其中 `3a21171`（model 路由）**尚未 push**，实测已通过，待合并。
 
 ## 进度图例
 - ✅ 已完成
@@ -75,3 +77,31 @@
 - `9f7bdfa` fix: 重试计数器未累加，补充 recordRetry() 调用  (Day 1)
 - `f2cad48` fix: 暴露请求级延迟指标                  (Day 2)
 - `2168897` refactor: 移除 SSE body HEX dump，调试日志加 -debug 开关 (Day 3)
+- `28b474b` fix: 优雅关闭改用 Shutdown(ctx)，避免瞬间切断在途连接 (Day 4)
+- `2366543` docs: ROADMAP 标记 Day 4 完成
+- `e4016e2` chore: 补 Apache-2.0 LICENSE 并重写 README 定位为通用推理控制平面
+- `4dd1c20` chore: module path 改 github.com/dalemei/inference-gateway，ROADMAP 目标改周更质量优先
+- `d6c8b35` refactor: 按 cmd/internal 结构拆分包，更新代码结构
+- `3a21171` feat: 按 model 路由到不同后端池，指标加 model 标签  ⚠️ **尚未 push**
+
+## 待提交（2026-09-15 本机 Ollama 实测后修复，未 commit）
+
+实测发现 3 个真实缺陷并已修复，改动 6 个文件（+99/-16），`go vet` / `go build` 均通过。
+建议拆成 3 个 commit（遵循一日一 commit、改动可独立回滚）：
+
+1. `feat: 健康检查路径与超时可配置` — 各推理引擎健康检查约定不一（vLLM/TGI=`/health`、Ollama=`/`）
+2. `fix: 后端返回 429/502/503/504 时换节点重试` — 此前只有网络错误才重试
+3. `fix: errors_total 输出运行期新增类型` — 修复新错误类型被静默丢弃的埋点废点
+
+明细与实测证据见 `TESTING.md` §3.9 / §3.10。
+
+## 第二批：性能与并发正确性（2026-09-15 晚，同样未 commit）
+
+开 GPU 前做了一轮完整代码走读，先修掉三个**会污染压测数据**的问题（详见 TESTING.md §3.12）：
+
+4. `perf: 连接池 MaxIdleConnsPerHost 默认只有 2 → 100`（网关只连少数后端，不调大连复用率上不去，压出来的"网关开销"其实是"建连开销"）
+5. `fix: Backend.Latency 改 atomic.Int64`（健康检查写 / metrics 读，原本是 data race，ROADMAP Day 8 已列未做）
+6. `fix: 健康检查读完 body 再 Close`（只 Close 不读，连接无法归还池，长期运行积累 TIME_WAIT）
+
+本机 Ollama 回归验证通过（health / backends latency_ms=2.06 / chat 200 / 并发 20 轮读指标无异常）。
+`-race` 检测本机跑不了（无 gcc），已写成 `gpu-bench/5_racecheck.sh`，在 AutoDL 上跑。

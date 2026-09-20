@@ -22,6 +22,44 @@
 - 模型默认 `Qwen2.5-7B-Instruct-AWQ`（权重 ~5.5G），**2 副本**，各占 42% 显存
 - 网关与 vLLM **同机部署**（localhost），测出的就是纯转发开销，不含网络跳
 
+## 开机后 60 秒：先做这两件事（能省 20 分钟）
+
+### ⚠️ 坑 1：`igw-linux-amd64` 不在仓库里
+
+仓库的 `.gitignore` 忽略了这个交叉编译产物，**clone 下来不会有**。而 `2_start_gateway.sh` 找不到它会去找 Go，找不到 Go 就 FATAL。
+
+两个办法，任选：
+
+```bash
+# A. 本机编译好传上去（推荐，10MB，免装 Go）
+#    在 Windows 本机执行：
+#    GOOS=linux GOARCH=amd64 go build -o igw-linux-amd64 ./cmd/gateway
+#    然后上传到 /root/autodl-tmp/inference-gateway/
+#    上传后务必 chmod +x：
+chmod +x /root/autodl-tmp/inference-gateway/igw-linux-amd64
+
+# B. AutoDL 上有 Go 就直接编译（脚本会自动走到这条分支）
+cd /root/autodl-tmp/inference-gateway && GOOS=linux GOARCH=amd64 go build -o igw-linux-amd64 ./cmd/gateway
+```
+
+### ⚠️ 坑 2：先看数据盘里已经有什么，别重复下载
+
+`/root/autodl-tmp` 关机保留。**先看一眼能省掉 5~15G 的下载时间**：
+
+```bash
+ls /root/autodl-tmp/models/ 2>/dev/null          # 已有模型
+ls -d /root/vllm-env /root/autodl-tmp/vllm-env 2>/dev/null   # venv 在哪
+source <上面查到的路径>/bin/activate && python -c "import vllm;print(vllm.__version__)"
+```
+
+- 如果已有 `Qwen2.5-7B-Instruct`（BF16，非 AWQ）→ **改一行 `env.sh` 直接用它**，不要下 AWQ：
+  ```bash
+  export MODEL_REPO="Qwen/Qwen2.5-7B-Instruct"     # 改成本机已有的
+  export GPU_UTIL="0.45"                            # BF16 比 AWQ 占显存，2 副本各 45% 尚可
+  ```
+  改完记得 `source env.sh` 让变量生效。
+- venv 不存在 → 先 `python -m venv /root/autodl-tmp/vllm-env && pip install vllm`。
+
 ## 执行顺序
 
 ```bash
@@ -29,16 +67,33 @@ cd /root/autodl-tmp/inference-gateway/gpu-bench   # 或 git pull 后进入
 
 source env.sh          # 所有变量在这里，改模型/副本数只动这个文件
 bash 1_start_vllm.sh   # 下载模型 + 起 2 个 vLLM 实例（首次含下载，约 10-20 min）
-bash 2_start_gateway.sh # 编译 + 起网关，确认 healthy_backends=2
+bash 2_start_gateway.sh # 起网关，确认 healthy_backends=2
 bash 3_compare.sh      # 实验 1 + 2，结果写 results/
+bash 5_racecheck.sh    # 附加：并发竞态检测（AutoDL 有 gcc，本机没有）
 bash 4_failover.sh     # 实验 3
 ```
+
+> `2_start_gateway.sh` 跑完**必须看到 `healthy_backends` = 2** 再往下走。
+> 只有 1 个说明另一个副本没起来（大概率显存不够或还在加载），去看 `$WORKDIR/logs/` 下的 vLLM 日志。
 
 ## 成本纪律
 
 - **先跑 3_compare.sh，确认拿到数据再跑 4_failover.sh**（后者会杀进程，可能要重启实例）。
 - 全部跑完立刻关机；`results/` 与模型都在 `/root/autodl-tmp`，关机不丢。
 - 卡住超过 10 分钟无进展 → 先看 `nvidia-smi` 和 vLLM 日志，不要空烧机时。
+
+## 跑完把数据带回来（关机前必做）
+
+```bash
+# 结果在 $RESULT_DIR（默认 /root/autodl-tmp/ig-bench/results）
+ls -l /root/autodl-tmp/ig-bench/results/
+cat /root/autodl-tmp/ig-bench/results/*.md     # 3_compare 会生成 Markdown 汇总表
+
+# 打包，方便一次性 scp 回来
+cd /root/autodl-tmp/ig-bench && tar czf results.tgz results/
+```
+
+把 Markdown 汇总表（或 `results.tgz`）带回来再关机——数据不在手里就关机等于白烧钱。
 
 ## 已知坑
 

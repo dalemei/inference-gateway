@@ -43,6 +43,8 @@
 | 失败重试 | 可配置重试次数，自动排除已失败后端 |
 | SSE 流式代理 | `stream: true` 请求逐块转发，支持 Flusher 降级 |
 | 编码自动修复 | 检测 GBK → 自动转 UTF-8（解决 Windows 终端乱码） |
+| **请求体上限** | 可配 `max_body_size`（默认 16MB），超限返回 413，防止 GB 级 body 打满内存 |
+| **流式超时守卫** | 空闲超时（两次数据块间隔）+ 可选总时长上限，防后端卡死导致连接永久挂起 |
 | Prometheus 指标 | 10 个指标，纯 stdlib 实现，零依赖 |
 | 结构化日志 | 请求 ID 追踪，`[请求 #N]` 格式贯穿全链路 |
 | 优雅关闭 | SIGINT/SIGTERM 触发，停止健康检查再退出 |
@@ -115,6 +117,13 @@ gateway:
   timeout: "120s"     # 后端请求超时（vLLM 推理较慢，建议设大一些）
   max_retries: 1      # 失败重试次数（0=不重试）
 
+  # 请求体上限，支持 "16MB" / "512KB" / "1G"；填 "0" = 不限制（不推荐）
+  max_body_size: "16MB"
+  # 流式空闲超时：两次数据块之间的最大间隔，收到数据即重置；"0" = 不启用
+  stream_idle_timeout: "120s"
+  # 单条流最长总时长，兜底「极慢但一直在吐」的连接；"0" = 不限制（默认）
+  stream_max_duration: "0"
+
 backends:
   - name: "vllm-node-1"               # 标识名，出现在日志和指标中
     url: "http://192.168.1.101:8000"  # 后端地址
@@ -170,7 +179,7 @@ backends:
 |------|------|------|
 | `inference_gateway_uptime_seconds` | gauge | 运行时长 |
 | `inference_gateway_requests_total` | counter | 请求总数（按后端+状态码） |
-| `inference_gateway_errors_total` | counter | 错误数（按类型） |
+| `inference_gateway_errors_total` | counter | 错误数（按类型：`no_healthy_backend` / `backend_unreachable` / `all_retries_failed` / `retryable_status` / `request_body_too_large` / `stream_idle_timeout` / `stream_max_duration`） |
 | `inference_gateway_retries_total` | counter | 重试次数 |
 | `inference_gateway_sse_connections_active` | gauge | 当前活跃 SSE 连接 |
 | `inference_gateway_sse_connections_total` | counter | SSE 连接历史总数 |
@@ -208,6 +217,25 @@ Windows 终端（CMD/PowerShell）默认编码是 GBK。当用户用 `curl` 发�
 ### 为什么流式请求不用带超时的 Client？
 
 SSE 流式响应可能持续数分钟（长文本生成），如果设置了 `http.Client.Timeout`，到达超时时间后连接被强制关闭，客户端收到的回复会截断。流式处理时给 `streamClient` 设 `Timeout: 0`，复用 `p.client.Transport` 的连接池即可。
+
+### 为什么流式请求必须清掉 Server.WriteTimeout？
+
+`http.Server.WriteTimeout` **不是在每次 Write 时重置，而是在「请求头读完时」给连接打一次写 deadline，整个请求期间不再变动**（Go 源码 `net/http/server.go` 的 `readRequest`：`defer c.rwc.SetWriteDeadline(time.Now().Add(d))`）。
+
+对普通请求这是对的；对 SSE 这种分钟级长连接，它等同于**到点硬掐**。实测：
+
+| 场景（后端每秒 1 个 chunk，共 6 秒） | 客户端实际收到 |
+|---|---|
+| `WriteTimeout=3s`，未处理 | 3 个 chunk，`unexpected EOF`（24/48 字节） |
+| 用 `http.ResponseController.SetWriteDeadline(time.Time{})` 清掉 | 6 个 chunk，正常 EOF（48/48 字节） |
+
+所以 `handleStreaming` 一进来就清掉写 deadline，改由自己的超时守卫接管。只给流式清，非流式仍受 `WriteTimeout` 保护。
+
+### 为什么用「空闲超时」而不是 `ResponseHeaderTimeout`？
+
+`http.Client.ResponseHeaderTimeout` 只覆盖「等首字节」这一段，管不了「吐了一半卡死」——而后者在 GPU OOM / 显存打满时才是常态。空闲超时从发请求起算、每次收到数据就重置，两种故障一并覆盖，只需一个配置项。
+
+超时触发时 200 已经发出、无法再改状态码，网关会补发一个 SSE `event: error` 再关闭，让客户端能区分「被网关掐断」和「流正常结束」。
 
 ### 为什么不支持流式请求的重试？
 

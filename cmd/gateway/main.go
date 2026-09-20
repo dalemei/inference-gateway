@@ -39,6 +39,33 @@ func main() {
 		timeout = 60 * time.Second
 	}
 
+	// 解析请求体上限（如 "16MB"；"0" = 不限制）
+	maxBodyBytes, err := config.ParseSize(cfg.Gateway.MaxBodySize)
+	if err != nil {
+		log.Printf("[WARN] 无效的 max_body_size %q，使用默认 16MB: %v", cfg.Gateway.MaxBodySize, err)
+		maxBodyBytes = 16 << 20
+	}
+	if maxBodyBytes == 0 {
+		log.Println("[WARN] max_body_size = 0：请求体不做任何限制，异常客户端可打满网关内存")
+	}
+
+	// 解析流式空闲超时（"0" = 不启用）
+	streamIdle, err := time.ParseDuration(cfg.Gateway.StreamIdleTimeout)
+	if err != nil || streamIdle < 0 {
+		log.Printf("[WARN] 无效的 stream_idle_timeout %q，使用默认 120s", cfg.Gateway.StreamIdleTimeout)
+		streamIdle = 120 * time.Second
+	}
+	if streamIdle == 0 {
+		log.Println("[WARN] stream_idle_timeout = 0：后端卡死时流式连接将永久挂起")
+	}
+
+	// 解析单条流总时长上限（"0" = 不限制）
+	streamMax, err := time.ParseDuration(cfg.Gateway.StreamMaxDuration)
+	if err != nil || streamMax < 0 {
+		log.Printf("[WARN] 无效的 stream_max_duration %q，按 0（不限制）处理", cfg.Gateway.StreamMaxDuration)
+		streamMax = 0
+	}
+
 	// 解析默认池名（未显式配置时回退为 "default"）
 	defaultPool := cfg.DefaultPool
 	if defaultPool == "" {
@@ -89,7 +116,14 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	// 创建代理
-	gw := proxy.NewProxy(r, timeout, cfg.Gateway.MaxRetries, *debug)
+	gw := proxy.NewProxy(r, proxy.Options{
+		Timeout:           timeout,
+		MaxRetries:        cfg.Gateway.MaxRetries,
+		MaxBodyBytes:      maxBodyBytes,
+		StreamIdleTimeout: streamIdle,
+		StreamMaxDuration: streamMax,
+		Debug:             *debug,
+	})
 
 	// ====== 路由注册 ======
 	mux := http.NewServeMux()
@@ -146,6 +180,19 @@ func main() {
 	}
 	log.Printf("超时设置: %v", timeout)
 	log.Printf("最大重试: %d", cfg.Gateway.MaxRetries)
+	if maxBodyBytes > 0 {
+		log.Printf("请求体上限: %d 字节 (%s)", maxBodyBytes, cfg.Gateway.MaxBodySize)
+	} else {
+		log.Printf("请求体上限: 不限制 ⚠")
+	}
+	if streamIdle > 0 {
+		log.Printf("流式空闲超时: %v", streamIdle)
+	} else {
+		log.Printf("流式空闲超时: 未启用 ⚠")
+	}
+	if streamMax > 0 {
+		log.Printf("单条流总时长上限: %v", streamMax)
+	}
 	log.Printf("调试日志: %v", *debug)
 	log.Println("=======================================")
 

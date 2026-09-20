@@ -13,6 +13,13 @@ gateway:
   timeout: "120s"      # CPU 推理较慢，给足超时
   max_retries: 1
 
+  # 请求体上限（默认 16MB，填 "0" = 不限制）
+  max_body_size: "16MB"
+  # 流式空闲超时：两次数据块之间的最大间隔。CPU 推理慢，给到 180s 更稳妥
+  stream_idle_timeout: "180s"
+  # 单条流总时长上限，"0" = 不限制
+  stream_max_duration: "0"
+
 default_pool: "default"
 
 backends:

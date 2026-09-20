@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,24 +25,47 @@ import (
 // requestIDCounter 自增请求 ID 计数器
 var requestIDCounter atomic.Uint64
 
+// errStreamTimeout 流式超时守卫触发时写入 context 的 cause。
+// 用 cause 而不是直接判断 ctx.Err()，是为了把「网关主动掐断」和「客户端断开连接」
+// 区分开——两者都会让 ctx 进入 canceled 状态，但后续处理不同（前者要补发 SSE error 事件）。
+var errStreamTimeout = errors.New("stream timeout guard triggered")
+
 // Proxy 推理请求代理，负责接收客户端请求并转发到健康后端
 type Proxy struct {
-	router     *router.ModelRouter
-	timeout    time.Duration
-	maxRetries int
-	debug      bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
-	client     *http.Client // 共享 HTTP 客户端（连接池复用）
+	router            *router.ModelRouter
+	timeout           time.Duration
+	maxRetries        int
+	maxBodyBytes      int64         // 请求体上限，0 = 不限制
+	streamIdleTimeout time.Duration // 流式空闲超时，0 = 不启用
+	streamMaxDuration time.Duration // 单条流总时长上限，0 = 不限制
+	debug             bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
+	client            *http.Client  // 共享 HTTP 客户端（连接池复用）
+}
+
+// Options 创建 Proxy 的配置项。
+// 参数超过三个后用结构体传参：既避免长参数列表难以核对顺序，
+// 也让后续新增（鉴权 Key、限流等）不必再改调用点签名。
+type Options struct {
+	Timeout           time.Duration // 非流式请求的后端超时
+	MaxRetries        int           // 失败重试次数（0=不重试）
+	MaxBodyBytes      int64         // 请求体上限，0 = 不限制
+	StreamIdleTimeout time.Duration // 流式空闲超时，0 = 不启用
+	StreamMaxDuration time.Duration // 单条流总时长上限，0 = 不限制
+	Debug             bool
 }
 
 // NewProxy 创建代理实例
-func NewProxy(r *router.ModelRouter, timeout time.Duration, maxRetries int, debug bool) *Proxy {
+func NewProxy(r *router.ModelRouter, opt Options) *Proxy {
 	return &Proxy{
-		router:     r,
-		timeout:    timeout,
-		maxRetries: maxRetries,
-		debug:      debug,
+		router:            r,
+		timeout:           opt.Timeout,
+		maxRetries:        opt.MaxRetries,
+		maxBodyBytes:      opt.MaxBodyBytes,
+		streamIdleTimeout: opt.StreamIdleTimeout,
+		streamMaxDuration: opt.StreamMaxDuration,
+		debug:             opt.Debug,
 		client: &http.Client{
-			Timeout: timeout,
+			Timeout: opt.Timeout,
 			Transport: &http.Transport{
 				MaxIdleConns: 100,
 				// MaxIdleConnsPerHost 默认是 2，对网关是致命的：
@@ -59,9 +84,26 @@ func NewProxy(r *router.ModelRouter, timeout time.Duration, maxRetries int, debu
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDCounter.Add(1)
 
-	// 读请求体
-	body, err := io.ReadAll(r.Body)
+	// 读请求体（带大小上限）
+	//
+	// Go 的 net/http 默认不限制请求体大小，任何人都能 POST 一个 GB 级 body 把网关内存打满。
+	// 这里用 http.MaxBytesReader 设一道闸：超限后 Read 返回 *http.MaxBytesError，
+	// 且后续读取一律失败，不会把超限内容读进内存。默认 16MB（长上下文够用，见 config.go）。
+	var bodyReader io.Reader = r.Body
+	if p.maxBodyBytes > 0 {
+		bodyReader = http.MaxBytesReader(w, r.Body, p.maxBodyBytes)
+	}
+
+	body, err := io.ReadAll(bodyReader)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			log.Printf("[请求 #%d] 请求体超过上限（限制 %d 字节）", reqID, p.maxBodyBytes)
+			metrics.RecordGatewayError("request_body_too_large")
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body too large: limit is %d bytes", p.maxBodyBytes))
+			return
+		}
 		log.Printf("[请求 #%d] 读取请求体失败: %v", reqID, err)
 		writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
@@ -274,6 +316,23 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 // ============================================================================
 
 func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []byte, reqID uint64, model string) {
+	// ===== 关键：清掉 Server.WriteTimeout 打在连接上的写 deadline =====
+	//
+	// Go 的 http.Server.WriteTimeout 是在「请求头读完时」给连接打一次写 deadline，
+	// 整个请求期间不重置（见 net/http/server.go readRequest 里的 defer SetWriteDeadline）。
+	// 对 SSE 这种分钟级长连接，它等同于到点硬掐：客户端收到 unexpected EOF 而不是完整流。
+	//
+	// 实测（WriteTimeout=3s 的 server 推 6 秒流）：客户端只收到前 3 秒的 24 字节后报
+	// unexpected EOF，应有 48 字节；用 ResponseController 清掉 deadline 后 48 字节完整收到。
+	//
+	// 因此流式请求必须自己接管超时——由下面的空闲守卫负责，而不是 Server.WriteTimeout。
+	// httptest.ResponseRecorder 等不支持 SetWriteDeadline 的 Writer 会返回 ErrNotSupported，
+	// 属预期行为（测试环境没有真实连接），不刷日志。
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		log.Printf("[SSE #%d] 清除写超时失败，长流可能被 Server.WriteTimeout 提前掐断: %v", reqID, err)
+	}
+
 	// 按 model 路由到对应后端池（未匹配则落默认池）
 	pool := p.router.Route(model)
 	if pool == nil {
@@ -293,7 +352,19 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		targetURL += "?" + r.URL.RawQuery
 	}
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
+	// 流式超时守卫用的 context：上游 client.Timeout 必须是 0（否则长生成被截断），
+	// 但那会让「后端卡死」的连接永久挂起。这里用可取消的 ctx 让阻塞中的 Read 能被打断。
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+
+	// 只有配置了超时才起守卫 goroutine，避免给正常请求增加无谓的调度开销
+	var progress chan struct{}
+	if p.streamIdleTimeout > 0 || p.streamMaxDuration > 0 {
+		progress = make(chan struct{}, 1)
+		go p.streamWatchdog(reqID, ctx, cancel, progress)
+	}
+
+	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -380,6 +451,14 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 			}
 			flusher.Flush()
 			totalBytes += int64(n)
+
+			// 通知守卫：本轮有数据流动，重置空闲计时器（非阻塞，漏一次通知无副作用）
+			if progress != nil {
+				select {
+				case progress <- struct{}{}:
+				default:
+				}
+			}
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
@@ -389,11 +468,75 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		}
 	}
 
+	// 被守卫主动掐断：此时 200 已发出，无法再改状态码。
+	// 按 SSE 语义补一个 error 事件再关闭，让客户端（OpenAI SDK 等）能区分
+	// 「网关主动超时」与「流正常结束」，而不是收到一个没头没尾的截断流。
+	if errors.Is(context.Cause(ctx), errStreamTimeout) {
+		log.Printf("[SSE #%d] 流被超时守卫终止 (已发送 %d bytes)", reqID, totalBytes)
+		fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":\"upstream timeout, stream terminated by gateway\",\"type\":\"gateway_timeout\"}}\n\n")
+		flusher.Flush()
+	}
+
 	metrics.RecordSSEConnectionClosed()
 	metrics.RecordRequest(model, backend.Name, resp.StatusCode, time.Since(start), totalBytes)
 	log.Printf("[SSE #%d] %s → %s %d (%.1fs, %d bytes)",
 		reqID, r.URL.Path, backend.Name, resp.StatusCode,
 		time.Since(start).Seconds(), totalBytes)
+}
+
+// streamWatchdog 流式超时守卫。
+//
+// 为什么不用 http.Client 的 ResponseHeaderTimeout 代替？
+// ResponseHeaderTimeout 只覆盖「等首字节」这一段，管不了「吐了一半卡死」；
+// 空闲超时从发请求起算、每次收到数据就重置，两种故障一并覆盖，只需一个配置项。
+//
+// progress 每来一次信号表示「刚有一批数据流动」，重置空闲计时器；
+// 空闲或总时长超时时，用 cancel 打断阻塞中的上游 Read（体现在 ctx 的 cause 上）。
+func (p *Proxy) streamWatchdog(reqID uint64, ctx context.Context, cancel context.CancelCauseFunc, progress <-chan struct{}) {
+	var idle *time.Timer
+	var idleC <-chan time.Time
+	if p.streamIdleTimeout > 0 {
+		idle = time.NewTimer(p.streamIdleTimeout)
+		idleC = idle.C
+		defer idle.Stop()
+	}
+
+	var max *time.Timer
+	var maxC <-chan time.Time
+	if p.streamMaxDuration > 0 {
+		max = time.NewTimer(p.streamMaxDuration)
+		maxC = max.C
+		defer max.Stop()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return // 流已结束（正常结束或客户端断开），守卫退出
+		case <-idleC:
+			log.Printf("[SSE #%d] 空闲 %v 内未收到后端数据，主动断开", reqID, p.streamIdleTimeout)
+			metrics.RecordGatewayError("stream_idle_timeout")
+			cancel(errStreamTimeout)
+			return
+		case <-maxC:
+			log.Printf("[SSE #%d] 单条流超过总时长上限 %v，主动断开", reqID, p.streamMaxDuration)
+			metrics.RecordGatewayError("stream_max_duration")
+			cancel(errStreamTimeout)
+			return
+		case <-progress:
+			if idle != nil {
+				// Stop 返回 false 说明定时器已触发且值未被取走，必须先排空 channel 再 Reset，
+				// 否则残留的到期值会立刻触发下一次 select，导致误杀。
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(p.streamIdleTimeout)
+			}
+		}
+	}
 }
 
 // ============================================================================

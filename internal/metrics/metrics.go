@@ -123,7 +123,15 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 	// 再输出运行期新增的类型。若只写死已知类型，新错误类型会被累加进 map 却
 	// 永不输出——等于埋了一个看不见的点（本仓库此前踩过的「埋点废点」）。
 	seen := make(map[string]bool, 8)
-	for _, t := range []string{"no_healthy_backend", "backend_unreachable", "all_retries_failed", "retryable_status"} {
+	for _, t := range []string{
+		"no_healthy_backend",
+		"backend_unreachable",
+		"all_retries_failed",
+		"retryable_status",
+		"request_body_too_large",
+		"stream_idle_timeout",
+		"stream_max_duration",
+	} {
 		count := errorCount[t]
 		sb.WriteString(fmt.Sprintf(`inference_gateway_errors_total{type="%s"} %d`+"\n", t, count))
 		seen[t] = true

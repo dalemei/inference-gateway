@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -9,6 +10,24 @@ import (
 
 	"github.com/dalemei/inference-gateway/internal/metrics"
 )
+
+// contextKey API Key 名称在 request context 中的键类型（不可导出，避免外部污染）。
+type contextKey struct{}
+
+// WithKeyName 把已通过鉴权的 Key 名写入 context，供下游（proxy）做 token 用量归因。
+//
+// 为什么走 context 而不是塞一个自定义请求头：
+// proxy 的 copyHeaders 会把请求头原样转发给后端，等于把内部标识泄露给上游推理服务；
+// context 只在本进程内传递，且随请求生命周期自动回收。
+func WithKeyName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, contextKey{}, name)
+}
+
+// KeyNameFrom 取出 context 中的 Key 名。未启用鉴权时返回空串（调用方按匿名处理）。
+func KeyNameFrom(ctx context.Context) string {
+	name, _ := ctx.Value(contextKey{}).(string)
+	return name
+}
 
 // Middleware 返回「鉴权 → 限流 → 业务」的 HTTP 中间件。
 //
@@ -49,7 +68,8 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		// 包裹响应器以捕获状态码：用量归因需要 {key, status_code} 两个维度，
 		// 而状态码只有下游写完响应才知道。
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		// 把 Key 名带进 context，让 proxy 能把 token 用量归因到具体调用方
+		next.ServeHTTP(rec, r.WithContext(WithKeyName(r.Context(), key.Name)))
 		metrics.RecordKeyRequest(key.Name, rec.status)
 	})
 }

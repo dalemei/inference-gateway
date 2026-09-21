@@ -48,7 +48,10 @@
 | **API Key 鉴权** | 可选开启；支持 `Authorization: Bearer` 与 `X-API-Key` 两种写法，配置里可填明文或 sha256 摘要 |
 | **按 Key 限流** | 每个 Key 独立令牌桶（QPS + 突发额度），超限返回 429 并带 `Retry-After` |
 | **用量归因** | 按 Key 统计请求数与状态码，支撑成本分摊与配额审计 |
-| Prometheus 指标 | 13 个指标，纯 stdlib 实现，零依赖 |
+| **Token 计量** | 解析后端 `usage`（输入/输出/缓存命中），按 model × backend × Key 三个维度出指标 |
+| **缓存命中率** | 取 `usage.prompt_tokens_details.cached_tokens`，直接量化前缀缓存省下的算力 |
+| **缺失可观测** | token 拿不到时单独记账（`usage_missing`），避免「统计不到」被误读成「成本降了」 |
+| Prometheus 指标 | 17 个指标，纯 stdlib 实现，零依赖 |
 | 结构化日志 | 请求 ID 追踪，`[请求 #N]` 格式贯穿全链路 |
 | 优雅关闭 | SIGINT/SIGTERM 触发，停止健康检查再退出 |
 
@@ -220,6 +223,28 @@ auth:
 | `inference_gateway_auth_failures_total` | counter | 鉴权失败数（按原因：`missing_key` / `invalid_key`） |
 | `inference_gateway_key_requests_total` | counter | **按 API Key 的请求数**（key + status_code），用于用量归因与成本分摊 |
 | `inference_gateway_key_throttled_total` | counter | 按 API Key 的限流拒绝次数 |
+| `inference_gateway_prompt_tokens_total` | counter | **输入 token 总数**（model + backend + key） |
+| `inference_gateway_completion_tokens_total` | counter | **输出 token 总数**（同上维度） |
+| `inference_gateway_cached_tokens_total` | counter | **前缀缓存命中的输入 token 数**（仅后端上报该字段时输出） |
+| `inference_gateway_usage_missing_total` | counter | 未取到 usage 的请求数（按原因：`no_usage_field` / `response_too_large` / `stream_aborted`） |
+
+#### 成本观测常用 PromQL
+
+```promql
+# 每个 Key 的日均输入 token 速率
+sum by (key) (rate(inference_gateway_prompt_tokens_total[5m]))
+
+# 缓存命中率（无 cached 序列 = 后端未上报该字段，不能当 0% 看）
+sum(rate(inference_gateway_cached_tokens_total[5m]))
+  / sum(rate(inference_gateway_prompt_tokens_total[5m]))
+
+# 输出 token 占比——输出单价通常是输入的 3~5 倍，这条线最能反映真实成本
+sum(rate(inference_gateway_completion_tokens_total[5m]))
+  / sum(rate(inference_gateway_prompt_tokens_total[5m]))
+
+# 计量健康度：缺失率持续 > 0 说明有请求的成本没被统计到
+sum(rate(inference_gateway_usage_missing_total[5m]))
+```
 
 > **为什么用量归因用独立指标，而不是给 `requests_total` 加 key 标签？**
 > `requests_total` 已经是 `model × backend × status_code` 的组合，再乘上 key 会让时间序列成倍膨胀。
@@ -238,7 +263,8 @@ inference-gateway/
 │   ├── backend/            # 后端结构体 + 健康检查 goroutine + 后端池
 │   ├── proxy/              # 核心代理逻辑（路由、编码修复、非流式/SSE 分发）
 │   ├── router/             # 按 model 路由到后端池
-│   └── metrics/            # Prometheus 指标（纯 stdlib，零外部依赖）
+│   ├── metrics/            # Prometheus 指标（纯 stdlib，零外部依赖）
+│   └── usage/              # token 用量解析（非流式整包 / 流式 SSE 逐行 / 请求体注入）
 ├── config.yaml             # 示例配置（鉴权默认关闭）
 ├── config.auth.example.yaml# 入口治理完整示例（可直接运行）
 ├── config.ollama.yaml      # 本机 Ollama 实测配置
@@ -299,6 +325,55 @@ SSE 流式响应可能持续数分钟（长文本生成），如果设置了 `ht
 单测里用一对对照用例锁死这个行为：有 `Unwrap` 时 `SetWriteDeadline` 成功，去掉 `Unwrap` 则失败——两个结果同时成立，才能确认穿透机制真实存在，而不是写了个空断言。
 
 端到端也验证过：开启鉴权后，后端持续吐 15 秒（网关 `timeout=2s` → `WriteTimeout=12s`），客户端完整收到 15 个 chunk，未被 12 秒硬切。
+
+### Token 计量：为什么流式必须网关注入 `stream_options`
+
+OpenAI 兼容协议下，**流式响应默认不返回 usage**。本机实测 Ollama：
+
+| 场景 | 结果 |
+|---|---|
+| 非流式 `/v1/chat/completions` | 响应里有完整 `usage` |
+| 流式，客户端不传 `stream_options` | **23 个 chunk，0 个含 usage** |
+| 流式 + `stream_options.include_usage=true` | 末尾多一个 `choices: []` + `usage` 的 chunk |
+
+而生产环境里流式恰恰是主要流量。网关若不主动注入，成本数据会缺掉一大块——这正是「推理网关」相对「日志分析工具」的价值：后者只能等客户端给，前者能主动要。
+
+注入行为由 `inject_stream_options` 控制（默认 `true`）。客户端已自带 `stream_options` 时网关一律不覆盖。代价是客户端会多收到一个 `choices` 为空数组的 chunk——这是 OpenAI 的标准行为（官方 SDK 直接跳过），但若你的自研客户端无条件取 `choices[0].delta.content` 会报错，此时设为 `false`，代价是流式用量不可见。
+
+任何解析/序列化失败都返回原始 body：计量功能绝不能改变转发行为。
+
+### 为什么 `cached` 序列按「字段是否上报」输出，而不是「值 > 0」
+
+`cached_tokens=0` 有两种完全不同的含义：**这次真没命中缓存** 与 **后端压根没统计这个字段**（vLLM 未加 `--enable-prompt-tokens-details` 时就不返回 `prompt_tokens_details`）。
+
+只看数值二者都是 0，会让缓存命中率在根本没有该能力时显示成「命中率 0%」，结论从「未观测」被误读成「缓存完全没生效」，排查方向直接跑偏到缓存配置上去。
+
+所以网关按 `HasCached`（字段是否存在）决定是否输出该序列：
+
+- 有序列且值为 0 → 确实没命中，缓存策略有问题
+- 无序列 → 后端未上报，先去查后端启动参数
+
+> vLLM 需要显式加 `--enable-prompt-tokens-details` 才会填充 `cached_tokens`（V1 引擎在 v0.9.0.1 之前该字段还是坏的）；SGLang 对应的是 `--enable-cache-report`。本机 Ollama 默认返回该字段。
+
+### 为什么 `usage_missing` 必须单独记账
+
+token 总量下降会被直觉读成「成本降低了」，但真实原因可能是后端升级后不再返回 usage，或流式被大量超时掐断。**分母缺失是成本看板最危险的失真**——它让所有基于 token 的判断都建立在错误的基数上。
+
+因此每次「本该有 usage 却没拿到」都单独计数，并按原因区分：
+
+| 原因 | 含义 | 排查方向 |
+|---|---|---|
+| `no_usage_field` | 响应 200 但解析不出 usage | 后端是否 OpenAI 兼容？路径是不是推理端点？ |
+| `response_too_large` | 响应体超过 8MB 解析上限 | 正常推理响应不会这么大，检查是否有非推理流量走了网关 |
+| `stream_aborted` | 流被超时守卫掐断，末尾 usage 永远等不到 | 查后端是否卡死 / `stream_idle_timeout` 是否过小 |
+
+该指标固定输出 0 基线：否则「从未缺失」和「埋点失效」在 `/metrics` 上长得一模一样。
+
+### token 计量为什么不引入 tokenizer
+
+精确统计输入 token 需要 tokenizer（如 `tiktoken`），那意味着引入模型词典与一个新的依赖面；而不同 tokenizer 之间本身就有 5%~15% 偏差，本地估算只能做量级。
+
+网关的定位是**搬运真实数据**而非**猜测**：一律以后端返回的 `usage` 为准（这也是各家计费口径），自己只做解析。代价是做不了「请求前的精确配额预扣」，但换来零依赖与和账单一致的口径。
 
 ### 为什么不支持流式请求的重试？
 

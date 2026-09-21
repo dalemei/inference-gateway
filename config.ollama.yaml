@@ -20,6 +20,12 @@ gateway:
   # 单条流总时长上限，"0" = 不限制
   stream_max_duration: "0"
 
+  # 是否解析后端返回的 usage 并计入 token 指标（默认 true）
+  track_usage: true
+  # 是否给流式请求自动补 stream_options.include_usage（默认 true）
+  # 流式响应默认不带 usage，不注入的话流式请求的成本永远看不见
+  inject_stream_options: true
+
 # 本配置刻意不开鉴权，方便直接压测转发链路。
 # 需要验证 API Key / 限流 / 用量归因时，改用 config.auth.example.yaml。
 

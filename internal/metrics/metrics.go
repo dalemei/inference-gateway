@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dalemei/inference-gateway/internal/backend"
+	"github.com/dalemei/inference-gateway/internal/usage"
 )
 
 // ========== 指标数据结构 ==========
@@ -30,6 +31,11 @@ var (
 	authFailureCount  = make(map[string]int64) // key: 失败原因（missing_key / invalid_key）
 	keyRequestCount   = make(map[string]int64) // key: "key名|status_code" → 按 Key 的用量
 	keyThrottledCount = make(map[string]int64) // key: key名 → 被限流次数
+
+	// token 用量维度（成本观测 / 按 Key 分账）
+	// key: "direction|model|backend|key"，direction ∈ prompt/completion/cached
+	tokenCount   = make(map[string]int64)
+	usageMissing = make(map[string]int64) // key: 缺失原因
 
 	totalRequests atomic.Int64
 	totalErrors   atomic.Int64
@@ -111,6 +117,60 @@ func RecordKeyThrottled(keyName string) {
 	defer metricsMu.Unlock()
 
 	keyThrottledCount[keyName]++
+}
+
+// ========== token 用量指标（成本观测 / 分账） ==========
+
+// AnonymousKey 未启用鉴权（或请求未携带 Key）时 token 指标的 key 标签取值。
+// 用一个固定字面量而不是空串：空标签在 PromQL 里写起来别扭（key=""），
+// 且容易被误读成「标签没打上」。
+const AnonymousKey = "anonymous"
+
+// usageMissingBaseline usage_missing 指标的基线原因枚举。
+// 与 errors_total 同样的理由：固定输出 0 基线，否则「从未缺失」和
+// 「埋点失效 / 后端集体不返回 usage」在 /metrics 上长得一模一样。
+var usageMissingBaseline = []string{
+	"no_usage_field",     // 响应 200 但解析不出 usage（后端不支持，或路径不是推理端点）
+	"response_too_large", // 响应体超过解析上限，跳过解析
+	"stream_aborted",     // 流被超时守卫掐断，末尾 usage chunk 永远等不到
+}
+
+// RecordTokens 记录一次请求的 token 用量。
+//
+// cached 序列的输出条件为什么是「后端上报了该字段」而不是「值 > 0」：
+// 按 > 0 输出的话，「这次真没命中（0）」与「后端没这个能力（也是 0 或缺失）」
+// 都会表现为序列不存在，缓存命中率无从区分「0%」和「未观测」。
+// 按 HasCached 输出后：有序列且为 0 = 确实没命中；无序列 = 后端未上报，
+// 需结合 usage_missing 与后端启动参数（vLLM 的 --enable-prompt-tokens-details）判断。
+func RecordTokens(model, backendName, keyName string, u usage.Usage) {
+	if model == "" {
+		model = "unknown"
+	}
+	if keyName == "" {
+		keyName = AnonymousKey
+	}
+
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+
+	base := model + "|" + backendName + "|" + keyName
+	tokenCount["prompt|"+base] += u.PromptTokens
+	tokenCount["completion|"+base] += u.CompletionTokens
+	if u.HasCached {
+		tokenCount["cached|"+base] += u.CachedTokens
+	}
+}
+
+// RecordUsageMissing 记录一次「本该有 usage 却没拿到」的请求。
+//
+// 没有这个指标，token 总量下降会被误读成「成本降低了」，
+// 而真实原因可能是后端升级后不再返回 usage、或流式被大量掐断。
+// 分母缺失是成本看板最危险的失真，必须单独可见。
+func RecordUsageMissing(reason string) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+
+	usageMissing[reason]++
 }
 
 // WriteMetrics 输出 Prometheus 兼容格式的指标（接收多后端池）
@@ -221,6 +281,34 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 		}
 	}
 
+	// ===== token 用量指标 =====
+	//
+	// 三个方向拆成三个指标族而不是一个带 direction 标签的指标：
+	// 缓存命中率要写成 rate(cached)/rate(prompt)，拆开后两个 rate 各取自
+	// 独立序列，语义清晰；合成一个的话每条 PromQL 都要先做 label filter 再聚合，易写错。
+	sb.WriteString("\n# HELP inference_gateway_prompt_tokens_total 输入 token 总数（按模型/后端/Key）\n")
+	sb.WriteString("# TYPE inference_gateway_prompt_tokens_total counter\n")
+	writeTokenFamily(&sb, "prompt", "inference_gateway_prompt_tokens_total")
+
+	sb.WriteString("\n# HELP inference_gateway_completion_tokens_total 输出 token 总数（按模型/后端/Key）\n")
+	sb.WriteString("# TYPE inference_gateway_completion_tokens_total counter\n")
+	writeTokenFamily(&sb, "completion", "inference_gateway_completion_tokens_total")
+
+	sb.WriteString("\n# HELP inference_gateway_cached_tokens_total 前缀缓存命中的输入 token 数（仅后端上报时输出）\n")
+	sb.WriteString("# TYPE inference_gateway_cached_tokens_total counter\n")
+	writeTokenFamily(&sb, "cached", "inference_gateway_cached_tokens_total")
+
+	// 用量缺失计数：token 指标的分母健康度。
+	// 只在有数据时输出——全 0 会让人误以为「一直没缺失」，而实际上可能只是没流量。
+	sb.WriteString("\n# HELP inference_gateway_usage_missing_total 未能取到 usage 的请求数（按原因）\n")
+	sb.WriteString("# TYPE inference_gateway_usage_missing_total counter\n")
+	for _, r := range usageMissingBaseline {
+		sb.WriteString(fmt.Sprintf(`inference_gateway_usage_missing_total{reason="%s"} %d`+"\n", r, usageMissing[r]))
+	}
+	for _, r := range sortedKeysOf(usageMissing, usageMissingBaseline...) {
+		sb.WriteString(fmt.Sprintf(`inference_gateway_usage_missing_total{reason="%s"} %d`+"\n", r, usageMissing[r]))
+	}
+
 	// 重试计数
 	sb.WriteString("\n# HELP inference_gateway_retries_total 请求重试总次数\n")
 	sb.WriteString("# TYPE inference_gateway_retries_total counter\n")
@@ -293,6 +381,32 @@ func sortedKeysOf(m map[string]int64, exclude ...string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// writeTokenFamily 输出某个方向（prompt/completion/cached）的全部 token 序列。
+// 调用方必须已持有 metricsMu。
+//
+// 键格式为 "direction|model|backend|key"；direction 由调用方给定，
+// 故先剥掉前缀再按三段拆，避免 model 名里若含 "|" 时把后面字段挤掉。
+func writeTokenFamily(sb *strings.Builder, direction, metricName string) {
+	prefix := direction + "|"
+	n := 0
+	for _, k := range sortedKeysOf(tokenCount) {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		rest := k[len(prefix):]
+		parts := strings.SplitN(rest, "|", 3)
+		for len(parts) < 3 {
+			parts = append(parts, "unknown")
+		}
+		sb.WriteString(fmt.Sprintf(`%s{model="%s",backend="%s",key="%s"} %d`+"\n",
+			metricName, parts[0], parts[1], parts[2], tokenCount[k]))
+		n++
+	}
+	if n == 0 {
+		sb.WriteString("# (尚无数据)\n")
+	}
 }
 
 // split2 按第一个 "|" 拆成两段；无分隔符时第二段返回 "unknown"

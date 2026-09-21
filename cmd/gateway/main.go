@@ -123,7 +123,10 @@ func main() {
 		MaxBodyBytes:      maxBodyBytes,
 		StreamIdleTimeout: streamIdle,
 		StreamMaxDuration: streamMax,
-		Debug:             *debug,
+		TrackUsage:        cfg.Gateway.TrackUsage,
+		// 注入只在计量开启时才有意义：不统计 token 就别去改客户端的请求体。
+		InjectStreamOptions: cfg.Gateway.TrackUsage && cfg.Gateway.InjectStreamOptions,
+		Debug:               *debug,
 	})
 
 	// ====== 入口治理：API Key 鉴权 + 按 Key 限流 ======

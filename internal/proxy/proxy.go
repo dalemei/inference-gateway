@@ -17,10 +17,27 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 
+	"github.com/dalemei/inference-gateway/internal/auth"
 	"github.com/dalemei/inference-gateway/internal/backend"
 	"github.com/dalemei/inference-gateway/internal/metrics"
 	"github.com/dalemei/inference-gateway/internal/router"
+	"github.com/dalemei/inference-gateway/internal/usage"
 )
+
+// usageParseLimit 非流式响应体参与 usage 解析的体积上限（8MB）。
+// 超过就放弃解析（响应照常转发）：为一个统计数字把超大响应体囤在内存里不划算，
+// 而正常推理响应远小于此。
+const usageParseLimit = 8 << 20
+
+// isInferencePath 判断请求路径是否是会产生 token 用量的推理端点。
+//
+// 网关转发任意路径（含 /v1/models 这类元数据接口），对非推理端点去统计
+// 「usage 缺失」只会污染指标——那不是缺失，是本来就没有。故只在推理端点上计量。
+func isInferencePath(path string) bool {
+	return strings.HasSuffix(path, "/chat/completions") ||
+		strings.HasSuffix(path, "/completions") ||
+		strings.HasSuffix(path, "/embeddings")
+}
 
 // requestIDCounter 自增请求 ID 计数器
 var requestIDCounter atomic.Uint64
@@ -32,14 +49,16 @@ var errStreamTimeout = errors.New("stream timeout guard triggered")
 
 // Proxy 推理请求代理，负责接收客户端请求并转发到健康后端
 type Proxy struct {
-	router            *router.ModelRouter
-	timeout           time.Duration
-	maxRetries        int
-	maxBodyBytes      int64         // 请求体上限，0 = 不限制
-	streamIdleTimeout time.Duration // 流式空闲超时，0 = 不启用
-	streamMaxDuration time.Duration // 单条流总时长上限，0 = 不限制
-	debug             bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
-	client            *http.Client  // 共享 HTTP 客户端（连接池复用）
+	router              *router.ModelRouter
+	timeout             time.Duration
+	maxRetries          int
+	maxBodyBytes        int64         // 请求体上限，0 = 不限制
+	streamIdleTimeout   time.Duration // 流式空闲超时，0 = 不启用
+	streamMaxDuration   time.Duration // 单条流总时长上限，0 = 不限制
+	trackUsage          bool          // 是否解析后端 usage 并计入 token 指标
+	injectStreamOptions bool          // 是否给流式请求补 stream_options.include_usage
+	debug               bool          // 调试日志开关：开启时打印请求头与 body（含敏感信息）
+	client              *http.Client  // 共享 HTTP 客户端（连接池复用）
 }
 
 // Options 创建 Proxy 的配置项。
@@ -51,19 +70,25 @@ type Options struct {
 	MaxBodyBytes      int64         // 请求体上限，0 = 不限制
 	StreamIdleTimeout time.Duration // 流式空闲超时，0 = 不启用
 	StreamMaxDuration time.Duration // 单条流总时长上限，0 = 不限制
-	Debug             bool
+	TrackUsage        bool          // 是否解析后端 usage 计入 token 指标
+	// InjectStreamOptions 是否给流式请求补 stream_options.include_usage。
+	// 仅当 TrackUsage 为 true 时才有意义。
+	InjectStreamOptions bool
+	Debug               bool
 }
 
 // NewProxy 创建代理实例
 func NewProxy(r *router.ModelRouter, opt Options) *Proxy {
 	return &Proxy{
-		router:            r,
-		timeout:           opt.Timeout,
-		maxRetries:        opt.MaxRetries,
-		maxBodyBytes:      opt.MaxBodyBytes,
-		streamIdleTimeout: opt.StreamIdleTimeout,
-		streamMaxDuration: opt.StreamMaxDuration,
-		debug:             opt.Debug,
+		router:              r,
+		timeout:             opt.Timeout,
+		maxRetries:          opt.MaxRetries,
+		maxBodyBytes:        opt.MaxBodyBytes,
+		streamIdleTimeout:   opt.StreamIdleTimeout,
+		streamMaxDuration:   opt.StreamMaxDuration,
+		trackUsage:          opt.TrackUsage,
+		injectStreamOptions: opt.InjectStreamOptions,
+		debug:               opt.Debug,
 		client: &http.Client{
 			Timeout: opt.Timeout,
 			Transport: &http.Transport{
@@ -123,6 +148,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isStreaming := detectStreaming(body)
 	// 解析 model 字段，用于按 model 路由到对应后端池
 	model := extractModel(body)
+
+	// 流式请求默认拿不到 usage，按需注入 stream_options.include_usage。
+	// 放在 extractModel 之后：保持「先读后写」的顺序，万一注入逻辑异常也不影响路由。
+	if isStreaming && p.trackUsage && p.injectStreamOptions {
+		if injected := usage.EnsureStreamOptions(body); !bytes.Equal(injected, body) {
+			log.Printf("[请求 #%d] 已注入 stream_options.include_usage（%d → %d 字节）",
+				reqID, len(body), len(injected))
+			body = injected
+		}
+	}
+
 	log.Printf("[请求 #%d] 流式检测: %v, model: %q, body 长度: %d 字节", reqID, isStreaming, model, len(body))
 	if isStreaming {
 		p.handleStreaming(w, r, body, reqID, model)
@@ -190,7 +226,7 @@ func extractModel(body []byte) string {
 // 若你的推理集群 500 多为 GPU OOM，可在此加入 http.StatusInternalServerError。
 func isRetryableStatus(code int) bool {
 	switch code {
-	case http.StatusTooManyRequests,  // 429
+	case http.StatusTooManyRequests, // 429
 		http.StatusBadGateway,         // 502
 		http.StatusServiceUnavailable, // 503
 		http.StatusGatewayTimeout:     // 504
@@ -245,14 +281,14 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 			return
 		}
 
-	// 复制请求头（排除 Host 和 Content-Length）
-	copyHeaders(proxyReq, r)
-	// 显式设置 Content-Length，避免 Go HTTP client 使用 chunked 编码导致后端解析异常
-	proxyReq.ContentLength = int64(len(body))
+		// 复制请求头（排除 Host 和 Content-Length）
+		copyHeaders(proxyReq, r)
+		// 显式设置 Content-Length，避免 Go HTTP client 使用 chunked 编码导致后端解析异常
+		proxyReq.ContentLength = int64(len(body))
 
-	// 发送请求
-	start := time.Now()
-	resp, err := p.client.Do(proxyReq)
+		// 发送请求
+		start := time.Now()
+		resp, err := p.client.Do(proxyReq)
 		duration := time.Since(start)
 
 		if err != nil {
@@ -290,9 +326,33 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 			}
 		}
 
-		// 写入状态码和响应体
+		// 写入状态码和响应体。
+		//
+		// 需要统计 token 时用 TeeReader 旁路累积一份，而不是先 ReadAll 再写：
+		// 后者要等整个响应体读完才开始写给客户端，首字节延迟等于末字节到达时间。
+		// TeeReader 边读边转发，客户端感知不到计量的存在（累积本身有上限保护）。
+		var tee io.Reader = resp.Body
+		var parseBuf *usage.CappedBuffer
+		track := p.trackUsage && resp.StatusCode == http.StatusOK && isInferencePath(r.URL.Path)
+		if track {
+			parseBuf = usage.NewCappedBuffer(usageParseLimit)
+			tee = io.TeeReader(resp.Body, parseBuf)
+		}
+
 		w.WriteHeader(resp.StatusCode)
-		written, _ := io.Copy(w, resp.Body)
+		written, _ := io.Copy(w, tee)
+
+		if track {
+			if u, ok := usage.ParseResponse(parseBuf.Bytes()); ok {
+				metrics.RecordTokens(model, backend.Name, auth.KeyNameFrom(r.Context()), u)
+			} else {
+				reason := "no_usage_field"
+				if parseBuf.Truncated() {
+					reason = "response_too_large"
+				}
+				metrics.RecordUsageMissing(reason)
+			}
+		}
 
 		// 记录指标
 		metrics.RecordRequest(model, backend.Name, resp.StatusCode, duration, written)
@@ -389,7 +449,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 	// 流式请求不能用带超时的 client（SSE 可能持续数分钟）
 	streamClient := &http.Client{
 		Transport: p.client.Transport, // 复用连接池
-		Timeout:   0,                   // 无超时
+		Timeout:   0,                  // 无超时
 	}
 
 	start := time.Now()
@@ -440,6 +500,14 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 	w.WriteHeader(resp.StatusCode)
 	metrics.RecordSSEConnection()
 
+	// 流式用量扫描器：逐行扫 SSE，抓取末尾那个带 usage 的 chunk。
+	// 只在推理端点上挂，避免给元数据接口增加无谓的扫描开销。
+	trackStream := p.trackUsage && isInferencePath(r.URL.Path)
+	var scanner *usage.StreamScanner
+	if trackStream {
+		scanner = &usage.StreamScanner{}
+	}
+
 	var totalBytes int64
 	buf := make([]byte, 4096)
 	for {
@@ -451,6 +519,12 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 			}
 			flusher.Flush()
 			totalBytes += int64(n)
+
+			// 旁路扫描 usage。注意喂的是原始字节：扫描器只读不写，
+			// 绝不改动转发内容——计量功能对客户端必须完全透明。
+			if scanner != nil {
+				scanner.Feed(buf[:n])
+			}
 
 			// 通知守卫：本轮有数据流动，重置空闲计时器（非阻塞，漏一次通知无副作用）
 			if progress != nil {
@@ -477,11 +551,32 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, body []b
 		flusher.Flush()
 	}
 
+	// 结算流式用量。若客户端自己没传 stream_options 且网关未注入，
+	// 这里必然拿不到 usage——正是 usage_missing{reason="no_usage_field"} 要暴露的情况。
+	var streamUsage usage.Usage
+	if trackStream {
+		u, ok := scanner.Usage()
+		if ok {
+			streamUsage = u
+			metrics.RecordTokens(model, backend.Name, auth.KeyNameFrom(r.Context()), u)
+		} else {
+			reason := "no_usage_field"
+			if errors.Is(context.Cause(ctx), errStreamTimeout) {
+				// 被守卫掐断时 usage 永远等不到（它在最后一个 chunk）。
+				// 必须单独标注：否则「流大量超时」会伪装成「后端不支持 usage」，
+				// 排查方向被带偏到后端配置上去。
+				reason = "stream_aborted"
+			}
+			metrics.RecordUsageMissing(reason)
+		}
+	}
+
 	metrics.RecordSSEConnectionClosed()
 	metrics.RecordRequest(model, backend.Name, resp.StatusCode, time.Since(start), totalBytes)
-	log.Printf("[SSE #%d] %s → %s %d (%.1fs, %d bytes)",
+	log.Printf("[SSE #%d] %s → %s %d (%.1fs, %d bytes, in=%d/out=%d/cached=%d tokens)",
 		reqID, r.URL.Path, backend.Name, resp.StatusCode,
-		time.Since(start).Seconds(), totalBytes)
+		time.Since(start).Seconds(), totalBytes,
+		streamUsage.PromptTokens, streamUsage.CompletionTokens, streamUsage.CachedTokens)
 }
 
 // streamWatchdog 流式超时守卫。

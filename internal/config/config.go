@@ -12,7 +12,7 @@ import (
 // Config 网关完整配置
 type Config struct {
 	Gateway     GatewayConfig   `yaml:"gateway"`
-	Auth        AuthConfig      `yaml:"auth"`         // 入口治理：API Key 鉴权 + 按 Key 限流
+	Auth        AuthConfig      `yaml:"auth"` // 入口治理：API Key 鉴权 + 按 Key 限流
 	Backends    []BackendConfig `yaml:"backends"`
 	Models      []ModelConfig   `yaml:"models"`       // model 名 → 后端池 映射
 	DefaultPool string          `yaml:"default_pool"` // 未匹配 model 的兜底池
@@ -87,6 +87,22 @@ type GatewayConfig struct {
 	// StreamMaxDuration 单条流的最长总时长，如 "10m"。兜底「极慢但一直在吐」的连接。
 	// 填 "0" 表示不限制（默认）。注意：正常的多轮长生成不应被此项误杀，默认关闭。
 	StreamMaxDuration string `yaml:"stream_max_duration"`
+
+	// TrackUsage 是否解析后端返回的 usage 并计入 token 指标。默认 true。
+	//
+	// 关掉它的唯一理由是极限压测时省掉解析开销；正常情况下这是成本观测的数据源头，
+	// 关掉等于网关对「每次调用花了多少 token」完全失明。
+	TrackUsage bool `yaml:"track_usage"`
+
+	// InjectStreamOptions 是否给流式请求自动补 stream_options.include_usage。默认 true。
+	//
+	// OpenAI 兼容协议下流式响应默认不带 usage：客户端不显式声明，后端就不会在末尾
+	// 追加 usage chunk。网关若不主动注入，流式（生产环境的主要流量）永远统计不到。
+	//
+	// 代价：客户端会多收到一个 choices 为空数组的 chunk。这是 OpenAI 的标准行为
+	// （官方 SDK 会跳过），但若有自研客户端无条件取 choices[0].delta.content，会报错——
+	// 这种情况下把它设为 false，代价是流式用量不可见。
+	InjectStreamOptions bool `yaml:"inject_stream_options"`
 }
 
 // BackendConfig 单个推理后端配置
@@ -106,14 +122,19 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// 注意：默认值在这里预置，yaml.Unmarshal 只覆盖文件中显式出现的字段。
+	// 所以 TrackUsage / InjectStreamOptions 这类布尔项可以放心用值类型——
+	// 文件里不写 → 保持 true；显式写 false → 变成 false。无需 *bool。
 	cfg := &Config{
 		Gateway: GatewayConfig{
-			Port:              8080,
-			Timeout:           "60s",
-			MaxRetries:        1,
-			MaxBodySize:       "16MB",
-			StreamIdleTimeout: "120s",
-			StreamMaxDuration: "0",
+			Port:                8080,
+			Timeout:             "60s",
+			MaxRetries:          1,
+			MaxBodySize:         "16MB",
+			StreamIdleTimeout:   "120s",
+			StreamMaxDuration:   "0",
+			TrackUsage:          true,
+			InjectStreamOptions: true,
 		},
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {

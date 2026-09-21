@@ -42,6 +42,48 @@ func TestParseSizeInvalid(t *testing.T) {
 	}
 }
 
+// TestAuthValidateFailClosed 鉴权配置必须 fail-closed：
+// 开了 enabled 却一个 Key 都解析不出来，等于「所有请求一律 401」。
+// 与其让网关带着这种配置上线，不如启动即失败。
+func TestAuthValidateFailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		auth AuthConfig
+	}{
+		{"enabled 但无 keys", AuthConfig{Enabled: true}},
+		{"Key 既无明文也无摘要", AuthConfig{Enabled: true, Keys: []KeyConfig{{Name: "a"}}}},
+		{"Key 缺 name", AuthConfig{Enabled: true, Keys: []KeyConfig{{Key: "x"}}}},
+		{"name 重复", AuthConfig{Enabled: true, Keys: []KeyConfig{
+			{Name: "dup", Key: "a"}, {Name: "dup", Key: "b"},
+		}}},
+		{"rate_limit 为负", AuthConfig{Enabled: true, Keys: []KeyConfig{{Name: "a", Key: "x", RateLimit: -1}}}},
+	}
+
+	for _, c := range cases {
+		a := c.auth // 取可寻址副本：validate 是指针接收者
+		if err := a.validate(); err == nil {
+			t.Errorf("%s: 应当报错（fail-closed），实际通过", c.name)
+		}
+	}
+
+	// 未启用鉴权时不校验——老配置升级后不能被意外的报错打断
+	off := AuthConfig{Enabled: false}
+	if err := off.validate(); err != nil {
+		t.Errorf("未启用鉴权时不该校验 Key，实际报错: %v", err)
+	}
+}
+
+// TestAuthValidateAcceptsValid 合法配置不应误报
+func TestAuthValidateAcceptsValid(t *testing.T) {
+	ok := AuthConfig{Enabled: true, Keys: []KeyConfig{
+		{Name: "team-a", Key: "sk-a"},
+		{Name: "team-b", KeyHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", RateLimit: 10, Burst: 20},
+	}}
+	if err := ok.validate(); err != nil {
+		t.Errorf("合法配置被误拒: %v", err)
+	}
+}
+
 // TestLoadConfigDefaults 未显式配置时必须补上安全默认值，
 // 尤其 max_body_size —— 缺省即"不限制"会直接把网关暴露在内存打满的风险里。
 func TestLoadConfigDefaults(t *testing.T) {

@@ -20,6 +20,9 @@ gateway:
   # 单条流总时长上限，"0" = 不限制
   stream_max_duration: "0"
 
+# 本配置刻意不开鉴权，方便直接压测转发链路。
+# 需要验证 API Key / 限流 / 用量归因时，改用 config.auth.example.yaml。
+
 default_pool: "default"
 
 backends:

@@ -11,10 +11,55 @@ import (
 
 // Config 网关完整配置
 type Config struct {
-	Gateway    GatewayConfig   `yaml:"gateway"`
-	Backends   []BackendConfig `yaml:"backends"`
-	Models     []ModelConfig   `yaml:"models"`      // model 名 → 后端池 映射
-	DefaultPool string         `yaml:"default_pool"` // 未匹配 model 的兜底池
+	Gateway     GatewayConfig   `yaml:"gateway"`
+	Auth        AuthConfig      `yaml:"auth"`         // 入口治理：API Key 鉴权 + 按 Key 限流
+	Backends    []BackendConfig `yaml:"backends"`
+	Models      []ModelConfig   `yaml:"models"`       // model 名 → 后端池 映射
+	DefaultPool string          `yaml:"default_pool"` // 未匹配 model 的兜底池
+}
+
+// AuthConfig 入口治理配置。
+//
+// 网关此前只做「透明转发」：谁在调、调了多少、能不能调，全无管控。
+// 这一层补上后，网关才配得上「控制平面」而不是「四层代理」。
+type AuthConfig struct {
+	// Enabled 是否启用鉴权。false（默认）时网关行为与之前完全一致，
+	// 保证老用户升级后不会被突如其来的 401 打断。
+	Enabled bool `yaml:"enabled"`
+
+	// Header 取 Key 的请求头名。留空（默认）时同时接受两种写法：
+	//   Authorization: Bearer <key>   ← OpenAI SDK / curl 惯例
+	//   X-API-Key: <key>              ← 部分内部系统惯例
+	// 显式指定（如 "X-Auth-Token"）则只认这一个头，值原样取用（Authorization 除外，仍按 Bearer 解析）。
+	Header string `yaml:"header"`
+
+	// ProtectMetrics 是否要求访问 /metrics 也带 Key。默认 false：
+	// Prometheus 抓取通常在内网，强制鉴权会让监控链路配置变复杂却挡不住真正的攻击面。
+	// 若网关直接暴露在公网，应设为 true。
+	ProtectMetrics bool `yaml:"protect_metrics"`
+
+	Keys []KeyConfig `yaml:"keys"`
+}
+
+// KeyConfig 单个 API Key
+type KeyConfig struct {
+	Name string `yaml:"name"` // 用于日志与指标标签的标识，如 "team-a"。不参与鉴权。
+
+	// Key 明文 Key。启动时立即算 sha256 并只保留摘要，明文不长期驻留内存。
+	// 与 KeyHash 二选一，两者都填以 KeyHash 为准。
+	Key string `yaml:"key"`
+
+	// KeyHash sha256 十六进制摘要（64 字符）。配置里不落明文，安全性更高，
+	// 但排障时无法反推原始 Key，需自行保管映射关系。
+	KeyHash string `yaml:"key_hash"`
+
+	// RateLimit 该 Key 每秒允许的请求数（令牌桶填充速率）。0 = 不限流（只鉴权）。
+	RateLimit float64 `yaml:"rate_limit"`
+
+	// Burst 突发容量（令牌桶上限）。0 = 自动取 max(1, RateLimit)。
+	// 推理请求天然是突发的（用户点一下发一批），纯 QPS 限制会把正常交互误杀，
+	// 所以默认给一拍突发额度。
+	Burst int `yaml:"burst"`
 }
 
 // ModelConfig 映射一个模型名到某个后端池
@@ -96,7 +141,48 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Gateway.StreamMaxDuration = "0"
 	}
 
+	// 鉴权配置的 fail-closed 校验：
+	// 开了 auth.enabled 却没配任何可用 Key，等于「所有请求一律 401」——
+	// 这是典型的配置漂移（改了 enabled 忘了加 keys，或 yaml 缩进错位导致 keys 没解析进来）。
+	// 与其让网关带着一个全拒绝的配置启动、上线后才发现，不如启动即失败。
+	if err := cfg.Auth.validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// validate 校验鉴权配置。只在 auth.enabled=true 时才要求 Key 非空。
+func (a *AuthConfig) validate() error {
+	if !a.Enabled {
+		return nil
+	}
+	if len(a.Keys) == 0 {
+		return fmt.Errorf("auth.enabled=true 但未配置任何 auth.keys —— 这会让所有请求一律 401；" +
+			"请补充 keys，或把 auth.enabled 设为 false")
+	}
+
+	seenName := make(map[string]bool, len(a.Keys))
+	for i, k := range a.Keys {
+		if strings.TrimSpace(k.Name) == "" {
+			return fmt.Errorf("auth.keys[%d] 缺少 name（name 用于日志与指标标签，必填）", i)
+		}
+		if seenName[k.Name] {
+			return fmt.Errorf("auth.keys[%d] name %q 重复：重名会让按 Key 的用量归因无法区分", i, k.Name)
+		}
+		seenName[k.Name] = true
+
+		if strings.TrimSpace(k.Key) == "" && strings.TrimSpace(k.KeyHash) == "" {
+			return fmt.Errorf("auth.keys[%d] (%s) 必须填 key 或 key_hash 之一", i, k.Name)
+		}
+		if k.RateLimit < 0 {
+			return fmt.Errorf("auth.keys[%d] (%s) rate_limit 不能为负数", i, k.Name)
+		}
+		if k.Burst < 0 {
+			return fmt.Errorf("auth.keys[%d] (%s) burst 不能为负数", i, k.Name)
+		}
+	}
+	return nil
 }
 
 // ParseSize 解析带单位的字节数：支持 "16MB" / "512K" / "1.5G" / "16777216"（纯数字按字节）。

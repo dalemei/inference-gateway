@@ -45,7 +45,10 @@
 | 编码自动修复 | 检测 GBK → 自动转 UTF-8（解决 Windows 终端乱码） |
 | **请求体上限** | 可配 `max_body_size`（默认 16MB），超限返回 413，防止 GB 级 body 打满内存 |
 | **流式超时守卫** | 空闲超时（两次数据块间隔）+ 可选总时长上限，防后端卡死导致连接永久挂起 |
-| Prometheus 指标 | 10 个指标，纯 stdlib 实现，零依赖 |
+| **API Key 鉴权** | 可选开启；支持 `Authorization: Bearer` 与 `X-API-Key` 两种写法，配置里可填明文或 sha256 摘要 |
+| **按 Key 限流** | 每个 Key 独立令牌桶（QPS + 突发额度），超限返回 429 并带 `Retry-After` |
+| **用量归因** | 按 Key 统计请求数与状态码，支撑成本分摊与配额审计 |
+| Prometheus 指标 | 13 个指标，纯 stdlib 实现，零依赖 |
 | 结构化日志 | 请求 ID 追踪，`[请求 #N]` 格式贯穿全链路 |
 | 优雅关闭 | SIGINT/SIGTERM 触发，停止健康检查再退出 |
 
@@ -138,9 +141,37 @@ backends:
     health_check_timeout: "3s"
     health_check_interval: "10s"
     pool: "default"
+
+# 入口治理（可选，默认关闭；完整示例见 config.auth.example.yaml）
+auth:
+  enabled: false
+  # header: "X-API-Key"      # 留空 = 同时接受 Authorization: Bearer <key> 与 X-API-Key: <key>
+  # protect_metrics: false   # /metrics 是否也要鉴权（公网暴露时建议 true）
+  # keys:
+  #   - name: "team-a"       # 标识名，出现在日志与指标标签中（不参与鉴权）
+  #     key: "sk-xxxx"       # 明文；启动时换算为 sha256，明文不驻留内存
+  #     # key_hash: "..."    # 或直接填 sha256 摘要（配置里不落明文）
+  #     rate_limit: 10       # 每秒请求数，0 = 不限流
+  #     burst: 20            # 突发容量，0 = 自动取 max(1, rate_limit)
 ```
 
 > 多后端时网关自动 round-robin 轮询。一个后端挂了，请求自动路由到其他健康节点。
+
+### 入口治理：API Key 鉴权与限流
+
+默认关闭，开启后推理路径（`/` 下所有请求）必须先通过鉴权才进入后端调度：
+
+| 场景 | 响应 |
+|------|------|
+| 未带 Key | `401` + `WWW-Authenticate: Bearer` |
+| Key 不匹配 | `401`，error type 为 `invalid_key` |
+| 超出该 Key 的限流额度 | `429` + `Retry-After`（秒） |
+| 通过 | 正常转发，并在 `/metrics` 中按 Key 计数 |
+
+两个刻意的设计取舍：
+
+1. **`auth.enabled=true` 但没配任何 Key 时启动失败**，而不是降级为"不鉴权"。配了 `enabled` 说明有管控意图，静默放行等于安全策略被无声绕过。
+2. **`/health`、`/backends` 默认不鉴权**：前者供 K8s probe 与负载均衡探活调用，加鉴权会让探活链路配置复杂化。`/metrics` 由 `protect_metrics` 单独控制。
 
 ### 健康检查路径：各家引擎约定不同
 
@@ -185,6 +216,14 @@ backends:
 | `inference_gateway_sse_connections_total` | counter | SSE 连接历史总数 |
 | `inference_gateway_backend_health` | gauge | 后端健康（1=健康, 0=故障） |
 | `inference_gateway_backend_latency_seconds` | gauge | 健康检查延迟 |
+| `inference_gateway_backend_request_latency_seconds` | gauge | 后端最近一次请求延迟 |
+| `inference_gateway_auth_failures_total` | counter | 鉴权失败数（按原因：`missing_key` / `invalid_key`） |
+| `inference_gateway_key_requests_total` | counter | **按 API Key 的请求数**（key + status_code），用于用量归因与成本分摊 |
+| `inference_gateway_key_throttled_total` | counter | 按 API Key 的限流拒绝次数 |
+
+> **为什么用量归因用独立指标，而不是给 `requests_total` 加 key 标签？**
+> `requests_total` 已经是 `model × backend × status_code` 的组合，再乘上 key 会让时间序列成倍膨胀。
+> 而"哪个后端处理了"与"哪个 Key 用了"是两个正交的关注点，拆成独立指标后靠 PromQL 聚合即可，既控制基数也让语义边界清晰。
 
 ---
 
@@ -192,17 +231,22 @@ backends:
 
 ```
 inference-gateway/
-├── main.go          # 入口：flag 解析 → 配置 → 后端池 → 路由 → 启动
-├── config.go        # 配置结构体 + YAML 加载（gopkg.in/yaml.v3）
-├── backend.go       # 后端结构体 + 健康检查 goroutine + 后端池
-├── proxy.go         # 核心代理逻辑（路由、编码修复、非流式/SSE 分发）
-├── metrics.go       # Prometheus 指标（纯 stdlib，零外部依赖）
-├── config.yaml      # 示例配置文件
-├── go.mod           # Go module 定义（仅依赖 yaml.v3 + x/text）
+├── cmd/gateway/main.go     # 入口：flag 解析 → 配置 → 后端池 → 路由 → 启动
+├── internal/
+│   ├── config/config.go    # 配置结构体 + YAML 加载 + 校验（gopkg.in/yaml.v3）
+│   ├── auth/               # 入口治理：API Key 鉴权 + 令牌桶限流 + 中间件
+│   ├── backend/            # 后端结构体 + 健康检查 goroutine + 后端池
+│   ├── proxy/              # 核心代理逻辑（路由、编码修复、非流式/SSE 分发）
+│   ├── router/             # 按 model 路由到后端池
+│   └── metrics/            # Prometheus 指标（纯 stdlib，零外部依赖）
+├── config.yaml             # 示例配置（鉴权默认关闭）
+├── config.auth.example.yaml# 入口治理完整示例（可直接运行）
+├── config.ollama.yaml      # 本机 Ollama 实测配置
+├── go.mod                  # 仅依赖 yaml.v3 + x/text
 └── go.sum
 ```
 
-**阅读顺序建议**：`main.go` → `config.go` → `backend.go` → `proxy.go` → `metrics.go`
+**阅读顺序建议**：`cmd/gateway/main.go` → `internal/config` → `internal/backend` → `internal/proxy` → `internal/auth` → `internal/metrics`
 
 ---
 
@@ -236,6 +280,25 @@ SSE 流式响应可能持续数分钟（长文本生成），如果设置了 `ht
 `http.Client.ResponseHeaderTimeout` 只覆盖「等首字节」这一段，管不了「吐了一半卡死」——而后者在 GPU OOM / 显存打满时才是常态。空闲超时从发请求起算、每次收到数据就重置，两种故障一并覆盖，只需一个配置项。
 
 超时触发时 200 已经发出、无法再改状态码，网关会补发一个 SSE `event: error` 再关闭，让客户端能区分「被网关掐断」和「流正常结束」。
+
+### 为什么限流自己写，不用 `golang.org/x/time/rate`？
+
+`x/time/rate` 是官方扩展库，质量没问题，但引入它会让 `go.mod` 多一条 `require`。本项目的立身之本是「零依赖单二进制」，为一个约 60 行的数据结构破这个例不划算。
+
+自研版还带来一个实际好处：`Allow(now)` 接收外部传入的时间戳，于是限流行为能用**假时钟做确定性单测**——`x/time/rate` 依赖真实时钟，只能靠 `sleep` 测，慢且不稳定。
+
+### 鉴权中间件最隐蔽的坑：包装 ResponseWriter 会毁掉 SSE
+
+中间件要用 `statusRecorder` 包裹 `ResponseWriter` 才能捕获状态码做用量归因。但这个包装有两个必须实现的接口，漏掉任何一个都会**静默**破坏流式响应：
+
+| 接口 | 漏掉的后果 |
+|---|---|
+| `Flush()` | 丢失 `http.Flusher` → proxy 走「降级为非流式」分支，响应变成一次性返回，流式彻底失效 |
+| `Unwrap()` | `http.NewResponseController(w)` 无法穿透到真实连接 → 上一节「清掉 WriteTimeout」的操作失败，**长 SSE 被硬掐** |
+
+单测里用一对对照用例锁死这个行为：有 `Unwrap` 时 `SetWriteDeadline` 成功，去掉 `Unwrap` 则失败——两个结果同时成立，才能确认穿透机制真实存在，而不是写了个空断言。
+
+端到端也验证过：开启鉴权后，后端持续吐 15 秒（网关 `timeout=2s` → `WriteTimeout=12s`），客户端完整收到 15 个 chunk，未被 12 秒硬切。
 
 ### 为什么不支持流式请求的重试？
 

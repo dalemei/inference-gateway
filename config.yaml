@@ -34,6 +34,21 @@ gateway:
   #   默认 "0"（不限制）。误杀风险高于空闲超时，一般保持关闭。
   stream_max_duration: "0"
 
+# ========== 入口治理：API Key 鉴权 + 按 Key 限流（可选） ==========
+# 默认关闭，网关行为与未启用时完全一致（纯转发）。
+# 开启后：推理路径（/ 下的所有请求）必须先通过鉴权，才能进入后端调度。
+#
+# 完整可运行示例见 config.auth.example.yaml
+auth:
+  enabled: false
+  # header: "X-API-Key"  # 留空则同时接受 Authorization: Bearer <key> 与 X-API-Key: <key>
+  # protect_metrics: false  # /metrics 是否也要求鉴权（公网暴露时建议 true）
+  # keys:
+  #   - name: "team-a"
+  #     key: "sk-team-a-请替换为随机串"
+  #     rate_limit: 10     # 每秒 10 个请求
+  #     burst: 20          # 突发额度，0 = 自动取 max(1, rate_limit)
+
 backends:
   # ========== AutoDL vLLM 后端 ==========
   # 启动 vLLM 后，需要在 AutoDL 控制台获取 SSH 隧道或公网 IP。

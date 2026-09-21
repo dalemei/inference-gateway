@@ -1,0 +1,94 @@
+# 入口治理示例配置：API Key 鉴权 + 按 Key 限流
+#
+# 用法：
+#   go run ./cmd/gateway --config config.auth.example.yaml
+#
+# 与 config.ollama.yaml 的区别仅是多了下面的 auth 段；后端仍是本机 Ollama。
+# 实测前请先确认 Ollama 已启动并拉了模型：
+#   ollama serve
+#   ollama pull qwen2.5:1.5b
+
+gateway:
+  port: 8080
+  timeout: "120s"
+  max_retries: 1
+  max_body_size: "16MB"
+  stream_idle_timeout: "180s"
+  stream_max_duration: "0"
+
+# ========== 入口治理 ==========
+auth:
+  enabled: true
+
+  # 取 Key 的请求头。留空 = 两种惯例都接受：
+  #   Authorization: Bearer <key>   ← OpenAI SDK / curl
+  #   X-API-Key: <key>              ← 部分内部系统
+  # header: "X-API-Key"   # 取消注释则只认这一个头
+
+  # /metrics 是否也要鉴权。默认 false（Prometheus 通常走内网抓取）；
+  # 网关直接暴露公网时改为 true。
+  protect_metrics: false
+
+  keys:
+    # 不限流的 Key：只做身份识别与用量归因
+    - name: "team-a"
+      key: "sk-team-a-change-me"
+      rate_limit: 0        # 0 = 不限流
+      # burst: 0           # rate_limit=0 时无意义
+
+    # 限流的 Key：10 req/s，允许 20 个突发
+    - name: "team-b"
+      key: "sk-team-b-change-me"
+      rate_limit: 10
+      burst: 20
+
+    # 只填摘要、不落明文的写法（更安全，但排障时无法反推原始 Key）：
+    # 生成方式见下方「如何生成 key_hash」
+    - name: "team-c"
+      key_hash: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8" # sha256("password")，示例值请勿使用
+      rate_limit: 2
+      burst: 2
+
+backends:
+  - name: "ollama-local"
+    url: "http://localhost:11434"
+    health_check_path: "/"      # Ollama 的健康端点是根路径，与 vLLM 的 /health 不同
+    health_check_interval: "15s"
+    pool: "default"
+
+default_pool: "default"
+
+# ========== 验证命令 ==========
+#
+# 1) 不带 Key → 401
+#    curl -i http://localhost:8080/v1/chat/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{"model":"qwen2.5:1.5b","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
+#
+# 2) 带正确 Key → 200
+#    curl -i http://localhost:8080/v1/chat/completions \
+#      -H "Authorization: Bearer sk-team-a-change-me" \
+#      -H "Content-Type: application/json" \
+#      -d '{"model":"qwen2.5:1.5b","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
+#
+# 3) 打满 team-c（2 req/s, burst 2）→ 第 3 个返回 429 并带 Retry-After
+#    for i in 1 2 3 4; do
+#      curl -s -o /dev/null -w "第 $i 次: %{http_code}\n" http://localhost:8080/v1/chat/completions \
+#        -H "Authorization: Bearer password" -H "Content-Type: application/json" \
+#        -d '{"model":"qwen2.5:1.5b","messages":[{"role":"user","content":"hi"}],"max_tokens":4}'
+#    done
+#
+# 4) 看按 Key 的用量归因
+#    curl -s http://localhost:8080/metrics | grep -E "key_requests_total|key_throttled|auth_failures"
+#
+# 5) 流式请求在鉴权下仍应逐块返回（验证中间件没吃掉 Flusher）
+#    curl -N http://localhost:8080/v1/chat/completions \
+#      -H "Authorization: Bearer sk-team-a-change-me" -H "Content-Type: application/json" \
+#      -d '{"model":"qwen2.5:1.5b","messages":[{"role":"user","content":"count to 5"}],"stream":true,"max_tokens":40}'
+#
+# ========== 如何生成 key_hash ==========
+#   Linux / macOS:
+#     echo -n "你的Key" | sha256sum | cut -d' ' -f1
+#   PowerShell:
+#     $s=[System.Text.Encoding]::UTF8.GetBytes("你的Key")
+#     (Get-FileHash -Algorithm SHA256 -InputStream ([System.IO.MemoryStream]::new($s))).Hash.ToLower()

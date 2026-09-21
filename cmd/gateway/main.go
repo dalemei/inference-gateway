@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dalemei/inference-gateway/internal/auth"
 	"github.com/dalemei/inference-gateway/internal/backend"
 	"github.com/dalemei/inference-gateway/internal/config"
 	"github.com/dalemei/inference-gateway/internal/proxy"
@@ -125,16 +126,41 @@ func main() {
 		Debug:             *debug,
 	})
 
+	// ====== 入口治理：API Key 鉴权 + 按 Key 限流 ======
+	//
+	// 默认关闭，老用户升级后行为不变；开启后才对推理路径生效。
+	var authenticator *auth.Authenticator
+	if cfg.Auth.Enabled {
+		authenticator, err = auth.New(cfg.Auth)
+		if err != nil {
+			// 启动即失败而不是降级为「不鉴权」：
+			// 配了 enabled=true 说明有管控意图，静默放行等于安全策略被无声绕过。
+			log.Fatalf("鉴权配置无效: %v", err)
+		}
+	}
+
 	// ====== 路由注册 ======
 	mux := http.NewServeMux()
 
-	// 网关自身端点
+	// 网关自身端点。/health 与 /backends 默认不鉴权：
+	// 前者供 K8s probe / 负载均衡探活调用，加鉴权会让探活链路配置复杂化；
+	// 后者属调试端点，内网使用。
 	mux.HandleFunc("/health", gw.HealthHandler)
-	mux.HandleFunc("/metrics", gw.MetricsHandler)
 	mux.HandleFunc("/backends", gw.BackendsHandler)
 
-	// 所有其他路径 → 代理转发到 vLLM
-	mux.HandleFunc("/", gw.ServeHTTP)
+	// /metrics 是否鉴权由 protect_metrics 决定（默认不鉴权，理由见 config.go）
+	if authenticator != nil && cfg.Auth.ProtectMetrics {
+		mux.Handle("/metrics", authenticator.Middleware(http.HandlerFunc(gw.MetricsHandler)))
+	} else {
+		mux.HandleFunc("/metrics", gw.MetricsHandler)
+	}
+
+	// 所有其他路径 → 鉴权 → 限流 → 代理转发到后端
+	if authenticator != nil {
+		mux.Handle("/", authenticator.Middleware(gw))
+	} else {
+		mux.HandleFunc("/", gw.ServeHTTP)
+	}
 
 	// ====== 启动服务器 ======
 	addr := fmt.Sprintf(":%d", cfg.Gateway.Port)
@@ -192,6 +218,15 @@ func main() {
 	}
 	if streamMax > 0 {
 		log.Printf("单条流总时长上限: %v", streamMax)
+	}
+	if authenticator != nil {
+		log.Printf("鉴权: 已启用")
+		for _, line := range authenticator.Describe() {
+			log.Printf("  - %s", line)
+		}
+		log.Printf("  /metrics 端点鉴权: %v", cfg.Auth.ProtectMetrics)
+	} else {
+		log.Printf("鉴权: 未启用 ⚠ 任何人都能直接调用后端（内网环境可接受，公网请务必开启）")
 	}
 	log.Printf("调试日志: %v", *debug)
 	log.Println("=======================================")

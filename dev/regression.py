@@ -769,16 +769,22 @@ def c_e6(ctx):
 @case("F1", "f", "后端延迟反映客户端真实等待", known=True,
       note="F2：start 计时写在重试循环内 + 失败路径不计延迟")
 def c_f1(ctx):
-    before = sum(v for (n, l), v in get_metrics().items()
-                 if n == "inference_gateway_requests_total")
-    t0 = time.time()
-    r = _chat(headers=AUTH_H)
-    wall = time.time() - t0
-    if r["status"] != 200:
-        return False, "请求失败：%d" % r["status"]
-    # slow-503 sleep 1.5s，客户端必然等待 >1s
+    # 连发 2 次取较长的那次：F1 修复后轮询严格交替，连续 2 次必定一次落
+    # good、一次落 slow-503。只发一次的话有 50% 概率压根不经过 slow-503，
+    # 用例会在「真缺陷」与「前提没建立」之间随机横跳，而两者都显示 KNOWN，
+    # 等于把「没测到」伪装成「已知缺陷」。
+    wall, status = 0.0, 0
+    for _ in range(2):
+        t0 = time.time()
+        r = _chat(headers=AUTH_H)
+        w = time.time() - t0
+        if w > wall:
+            wall, status = w, r["status"]
+    if status != 200:
+        return False, "请求失败：%d" % status
+    # slow-503 sleep 1.5s，经过它的那次客户端必然等待 >1s
     if wall < 1.0:
-        return False, "客户端仅等待 %.2fs，用例前提不成立" % wall
+        return False, "两次都没经过 slow-503（最长 %.2fs）—— 轮询可能又退化了" % wall
     m = get_metrics()
     lat = {l: v for (n, l), v in m.items()
            if n == "inference_gateway_backend_latency_seconds"}

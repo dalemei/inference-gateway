@@ -195,6 +195,13 @@ func (p *BackendPool) HealthyCount() int {
 
 // NextExcluding 返回下一个健康的后端，跳过 excluded 集合里的后端
 // excluded 是后端 Name 的集合，用于重试时避免再次命中已失败的后端
+//
+// 关键：本函数【不推进】全局游标 p.next。重试是「本次请求的补偿行为」，
+// 不是一次新的调度。若在这里推进，就会和 Next() 一起把同一个游标拨两次：
+// Next() 把游标从 1 拨到 0，NextExcluding 又从 0 拨回 1，一轮下来净移动为 0，
+// 后续每次 Next() 都落在同一个后端上 —— 轮询退化为固定节点，
+// 多后端池的负载会全压到一个节点，而 /metrics 上看不出任何异常。
+// 回归用例见 backend_test.go:TestNextExcludingDoesNotAdvanceCursor。
 func (p *BackendPool) NextExcluding(excluded map[string]bool) *Backend {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -208,7 +215,6 @@ func (p *BackendPool) NextExcluding(excluded map[string]bool) *Backend {
 		idx := (p.next + i) % len(p.backends)
 		b := p.backends[idx]
 		if b.IsHealthy() && !excluded[b.Name] {
-			p.next = (idx + 1) % len(p.backends)
 			return b
 		}
 	}
@@ -218,7 +224,6 @@ func (p *BackendPool) NextExcluding(excluded map[string]bool) *Backend {
 		idx := (p.next + i) % len(p.backends)
 		b := p.backends[idx]
 		if b.IsHealthy() {
-			p.next = (idx + 1) % len(p.backends)
 			return b
 		}
 	}

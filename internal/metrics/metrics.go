@@ -189,7 +189,10 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 	// 请求计数（按后端+状态码）
 	sb.WriteString("\n# HELP inference_gateway_requests_total 代理请求总数（按后端+状态码）\n")
 	sb.WriteString("# TYPE inference_gateway_requests_total counter\n")
-	for key, count := range requestCount {
+	// 必须走排序：直接 range map 会让这族指标（序列数最多的一族）顺序逐次变化，
+	// 排障时「这次比上次多了哪一行」就没法比对了。
+	for _, key := range sortedKeysOf(requestCount) {
+		count := requestCount[key]
 		parts := strings.SplitN(key, "|", 3)
 		model := "unknown"
 		backendName := "unknown"
@@ -342,10 +345,10 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 	// 请求级延迟（最近一次成功代理的耗时，秒）
 	sb.WriteString("\n# HELP inference_gateway_backend_request_latency_seconds 后端最近一次请求延迟（秒）\n")
 	sb.WriteString("# TYPE inference_gateway_backend_request_latency_seconds gauge\n")
-	for backend, lat := range requestLatency {
+	for _, backend := range sortedKeysOf(requestLatency) {
 		sb.WriteString(fmt.Sprintf(
 			`inference_gateway_backend_request_latency_seconds{backend="%s"} %.6f`+"\n",
-			backend, lat))
+			backend, requestLatency[backend]))
 	}
 
 	sb.WriteString("\n# HELP inference_gateway_backend_latency_seconds 健康检查延迟（秒）\n")
@@ -367,7 +370,10 @@ func WriteMetrics(w io.Writer, pools []*backend.BackendPool) {
 // Go 的 map 遍历顺序是随机的，直接输出会让每次抓取的指标行顺序都不同。
 // 语义上 Prometheus 不在乎顺序，但人工比对与 diff 会彻底失效，
 // 排障时「这次比上次多了哪一行」是关键信息，故统一排序。
-func sortedKeysOf(m map[string]int64, exclude ...string) []string {
+//
+// 用泛型是为了让 float64 的 map（如 requestLatency）也能走同一条排序路径 ——
+// 此前它只能服务 int64，结果 requestLatency 被迫裸遍历 map，成为漏网之鱼。
+func sortedKeysOf[T any](m map[string]T, exclude ...string) []string {
 	skip := make(map[string]bool, len(exclude))
 	for _, e := range exclude {
 		skip[e] = true

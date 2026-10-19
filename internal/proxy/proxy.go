@@ -319,6 +319,22 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request, body []byt
 			continue
 		}
 
+		// ===== 重试耗尽的留痕（状态码路径）=====
+		//
+		// 上面那段只覆盖了「还有重试次数」的情况。当这是最后一次尝试、拿到的仍是
+		// 可重试状态码时，意味着试遍了所有节点都没救回来。这类请求接着就会
+		// 直接 return 透传响应，**永远走不到循环外的 all_retries_failed**。
+		//
+		// 不补这一条，指标上就区分不了「试遍所有节点仍失败」与「首次命中就 503」，
+		// 而前者正是后端整体劣化最关键的早期信号，会被稀释成普通的 retryable_status。
+		// 连接错误耗尽走的是另一条路径（循环外），补这一条是为了让两条口径一致。
+		//
+		// maxRetries > 0 才记：配置为不重试时，单次失败不叫「重试耗尽」，
+		// 否则这条指标会退化成「后端返过多少次 503」，与 retryable_status 重复。
+		if p.maxRetries > 0 && attempt == p.maxRetries && isRetryableStatus(resp.StatusCode) {
+			metrics.RecordGatewayError("all_retries_failed")
+		}
+
 		// 复制响应头
 		for key, values := range resp.Header {
 			for _, v := range values {

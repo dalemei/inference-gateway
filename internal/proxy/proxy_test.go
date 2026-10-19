@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -477,5 +478,95 @@ func TestHealthHandlerHealthy(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"healthy_backends":1`) {
 		t.Fatalf("响应体应报告健康节点数，实际 %q", rec.Body.String())
+	}
+}
+
+// ============================================================================
+// 指标留痕：补测试之前，两条失败路径的指标口径是不一致的
+// ============================================================================
+
+// errorMetricValue 从 /metrics 文本里读出指定错误类型的当前计数。
+//
+// 指标注册在包级全局注册器上，同包的用例之间会互相累加，
+// 所以断言一律用「请求前后的增量」，绝不能写死绝对值。
+func errorMetricValue(t *testing.T, p *Proxy, errType string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	p.MetricsHandler(rec, httptest.NewRequest("GET", "/metrics", nil))
+
+	prefix := fmt.Sprintf(`inference_gateway_errors_total{type="%s"} `, errType)
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 64)
+		if err != nil {
+			t.Fatalf("解析指标行失败: %v — %q", err, line)
+		}
+		return v
+	}
+	return 0 // 该类型一次都没出现过，视为 0
+}
+
+// TestAllRetriesFailedRecordedWhenStatusCodeRetriesExhausted 是指标口径缺陷的回归测试。
+//
+// 修复前：最后一次尝试拿到 503 时，代码在循环内直接 return 透传响应，
+// 绕过了写在循环外的 RecordGatewayError("all_retries_failed")。实测数据：
+//
+//	后端持续 503 重试耗尽 → all_retries_failed = 0（缺失）
+//	后端连不上重试耗尽   → all_retries_failed = 1
+//
+// 后果是运维在 /metrics 上分不清「试遍所有节点仍失败」和「首次命中就 503」，
+// 而后者网关本可以自己救回来 —— 后端整体劣化这个信号因此被稀释掉了。
+func TestAllRetriesFailedRecordedWhenStatusCodeRetriesExhausted(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer up.Close()
+
+	p, pool := newTestProxy(t, Options{Timeout: 2 * time.Second, MaxRetries: 2})
+	pool.Add(newFakeBackend("a", up.URL, true))
+	pool.Add(newFakeBackend("b", up.URL, true))
+
+	before := errorMetricValue(t, p, "all_retries_failed")
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"m"}`))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("前置条件不成立：本用例需要客户端收到透传的 503，实际 %d", rec.Code)
+	}
+
+	after := errorMetricValue(t, p, "all_retries_failed")
+	if after != before+1 {
+		t.Fatalf("重试耗尽应恰好记一次 all_retries_failed，实际 %v → %v（增量 %v）",
+			before, after, after-before)
+	}
+}
+
+// TestAllRetriesFailedNotRecordedWhenRetriesDisabled 守住反向边界：
+// 配置为不重试（MaxRetries=0）时，单次 503 不叫「重试耗尽」。
+// 若这里也记，该指标就退化成「后端返过多少次 503」，与 retryable_status 重复失去意义。
+func TestAllRetriesFailedNotRecordedWhenRetriesDisabled(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer up.Close()
+
+	p, pool := newTestProxy(t, Options{Timeout: 2 * time.Second, MaxRetries: 0})
+	pool.Add(newFakeBackend("a", up.URL, true))
+
+	before := errorMetricValue(t, p, "all_retries_failed")
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"m"}`))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	after := errorMetricValue(t, p, "all_retries_failed")
+	if after != before {
+		t.Fatalf("未开启重试时不应记 all_retries_failed，实际 %v → %v", before, after)
 	}
 }
